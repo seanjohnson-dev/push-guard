@@ -2,6 +2,6 @@ export type TestResult = { failing: number } // 0 when every test passed; -1 whe
 
 declare module 'claude-code' {
   interface PluginState {
-    'push-guard': { last: TestResult | null }
+    'push-guard': { last: TestResult | null; held: string | null; allowed: string | null }
   }
 }

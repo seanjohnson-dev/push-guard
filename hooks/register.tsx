@@ -24,15 +24,67 @@ const FAILED_TEST = /✖|✗|✕|\bnot ok\b/
 // The `test` script `npm init` writes, which only prints an error
 const NO_TEST_SPECIFIED = /no test specified/
 
+// A test file: *.test.*, *.spec.*, *_test.*, test_*.py, test.js, or anything in a test/, tests/, spec/,
+// specs/, __tests__/ or __snapshots__/ folder. A project adds its own in package.json: "pushGuard": { "testFiles": [globs] }
+const TEST_FILE = /(?:^|\/)(?:tests?|specs?|__tests__|__snapshots__)\/|(?:^|[\/._-])(?:test|spec)s?\.[a-z0-9]+$|(?:^|\/)test_[^/]*\.py$/i
+// Where a command a person ran comes from: the prompt, the app, or a press in the UI
+const PERSON = ['composer', 'bridge', 'person']
+// git's empty tree: on a first push every commit is new, so the diff runs from nothing
+const EMPTY_TREE = '4b825dc642cb6eb9a060e54bf8d69288fbee4904'
+
 const last = atom({ plugin: 'push-guard', key: 'last' } as const, null)
+// The commit a push was held at for changed tests, and the one you allowed with /push-guard allow
+const held = atom({ plugin: 'push-guard', key: 'held' } as const, null)
+const allowed = atom({ plugin: 'push-guard', key: 'allowed' } as const, null)
+
+// package.json, or undefined when there is none or npm could not read it either
+async function readPackage(read: () => Promise<string>): Promise<any> {
+  try {
+    return JSON.parse(await read())
+  } catch {
+    return undefined
+  }
+}
 
 // Whether package.json has a `test` script that runs tests
-async function hasTests(read: () => Promise<string>): Promise<boolean> {
+function hasTests(pkg: any): boolean {
+  const test = pkg?.scripts?.test
+  return typeof test === 'string' && test.trim() !== '' && !NO_TEST_SPECIFIED.test(test)
+}
+
+// A glob from package.json as a pattern: * and ? stay in one folder, ** crosses folders
+const glob = (text: string) =>
+  new RegExp(`(?:^|/)${text.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*\*\/?/g, '\0').replace(/\*/g, '[^/]*').replace(/\?/g, '[^/]').replace(/\0/g, '.*')}(?:$|/)`)
+
+// The test files the commits being pushed change: from where HEAD left the upstream (or, on a new branch,
+// the remote's default branch) to HEAD. `changed` lost lines or were deleted or renamed, which is how a
+// failing test is made to pass; `added` are new files or only gained lines. Undefined when git can't say
+async function testChanges($: any, cwd: string | undefined, extra: RegExp[]) {
+  const git = async (...args: string[]) => {
+    const { exitCode, stdout } = await $.process.run(['git', ...args], cwd === undefined ? {} : { cwd })
+    return exitCode === 0 ? stdout : undefined
+  }
   try {
-    const test = JSON.parse(await read())?.scripts?.test
-    return typeof test === 'string' && test.trim() !== '' && !NO_TEST_SPECIFIED.test(test)
+    const head = (await git('rev-parse', 'HEAD'))?.trim()
+    if (!head) return undefined
+    let base = EMPTY_TREE
+    for (const ref of ['@{upstream}', 'origin/HEAD', 'origin/main', 'origin/master']) {
+      const found = (await git('merge-base', ref, 'HEAD'))?.trim()
+      if (found) { base = found; break }
+    }
+    const diff = await git('diff', '--numstat', '--no-renames', '-z', base, head)
+    if (diff === undefined) return undefined
+    const changed: string[] = []
+    const added: string[] = []
+    for (const line of diff.split('\0')) {
+      const match = /^(\d+|-)\t(\d+|-)\t([^]+)$/.exec(line) // with -z a path may hold any character
+      if (!match || !(TEST_FILE.test(match[3]) || extra.some(re => re.test(match[3])))) continue
+      // A path is shown to Claude, so it gets no newlines or other control characters to hide lines in
+      ;(match[2] === '0' ? added : changed).push(JSON.stringify(match[3]))
+    }
+    return { head, changed, added }
   } catch {
-    return false // no package.json, or one npm could not read either
+    return undefined // no git to ask: the push itself will say
   }
 }
 
@@ -84,14 +136,30 @@ function countFailing(output: string[]): number {
   return output.filter(line => FAILED_TEST.test(line)).length || -1
 }
 
-export const register: Register = on => {
+export const register: Register = (on, options) => {
+  on('session.start', async ($, e, next) => {
+    await $.command.register({ name: 'push-guard', description: 'push-guard: allow the held push that changes test files', argumentHint: 'allow' })
+    return next(e)
+  })
+
+  on('command.run', { command: 'push-guard' }, async ($, e) => {
+    if (String(e.args ?? '').trim() !== 'allow') return { text: 'push-guard: type /push-guard allow to let through the push it held for changed tests.' }
+    // Only an OK a person gave counts: typed at the prompt, or sent from the app; not a plugin, a script or Claude
+    if (!PERSON.includes((e as any).origin?.kind)) return { text: 'push-guard: only a person can allow a push that changes tests. Type /push-guard allow at the prompt yourself.' }
+    const head = await read($, held)
+    if (head === null) return { text: 'push-guard: no push is waiting for an OK.' }
+    await update($, allowed, () => head)
+    return { text: `push-guard: allowed the push of ${head.slice(0, 7)} with its test changes. Ask Claude to push again; a new commit needs a new OK.` }
+  })
+
   on('tool.call', { tool: 'Bash' }, async ($, e, next) => {
     if (!GIT_PUSH.test(e.command)) return next(e)
     // `git -C dir push` and `cd dir && git push` push the project in dir, so its tests are the ones to run
     const folder = pushFolder(e.command)
     const dir = folder === undefined || isAbsolute(folder) ? folder : join(await $.session.cwd(), folder)
     // A project with no npm tests has nothing to check, so the push goes ahead
-    if (!(await hasTests(() => $.fs.read(dir === undefined ? 'package.json' : join(dir, 'package.json'))))) return next(e)
+    const pkg = await readPackage(() => $.fs.read(dir === undefined ? 'package.json' : join(dir, 'package.json')))
+    if (!hasTests(pkg)) return next(e)
 
     $.ui.status('push-guard: running npm test…')
     const init = dir === undefined ? { timeoutMs: 600_000 } : { cwd: dir, timeoutMs: 600_000 }
@@ -102,7 +170,28 @@ export const register: Register = on => {
     const result: TestResult = { failing: exitCode === 0 ? 0 : countFailing(output) }
     await update($, last, () => result)
 
-    if (exitCode === 0) return next(e)
+    if (exitCode === 0) {
+      // Green tests prove little if the push changed the tests to match the code
+      // Anything but warn or off (a typo too) holds, so a slip in the option does not open the gate
+      const mode = ['warn', 'off'].find(m => m === String(options?.testChanges ?? '').trim().toLowerCase()) ?? 'block'
+      const extra = Array.isArray(pkg?.pushGuard?.testFiles) ? pkg.pushGuard.testFiles.filter((g: unknown) => typeof g === 'string').map(glob) : []
+      const tests = mode === 'off' ? undefined : await testChanges($, dir, extra)
+      if (tests?.changed.length && mode === 'block' && (await read($, allowed)) !== tests.head) {
+        await update($, held, () => tests.head)
+        return {
+          deny:
+            `push-guard: the tests pass, but this push changes or deletes existing tests, so it waits for a person's OK.\n\n` +
+            `Changed test files:\n${tests.changed.join('\n')}\n\n` +
+            'If a test was edited to make it pass, put it back and fix the code instead. If the change is meant ' +
+            '(the expected behaviour really changed), ask the user to type /push-guard allow, then push again. Do not run it yourself.',
+        }
+      }
+      // git could not say (no commit yet, a broken repo): there is nothing to hold, so say so instead of passing quietly
+      if (mode !== 'off' && tests === undefined) $.ui.toast('push-guard: could not tell which test files this push changes')
+      const n = tests?.changed.length || tests?.added.length
+      if (n) $.ui.toast(`push-guard: this push ${tests?.changed.length ? 'changes' : 'adds to'} ${n} test file${n === 1 ? '' : 's'}`)
+      return next(e)
+    }
 
     const failed = output.filter(line => FAILED_LINE.test(line))
     const shown = (failed.length ? failed : output.filter(Boolean).slice(-15)).join('\n')

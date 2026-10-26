@@ -1,1 +1,17 @@
-{ "name": "push-guard", "version": "0.3.1", "description": "Runs npm test before any git push, blocks the push if a test fails, and shows the last result above the prompt", "author": { "name": "Sean Johnson" }, "license": "MIT", "types": "./types/index.d.ts" }
+{
+  "name": "push-guard",
+  "version": "0.4.0",
+  "description": "Runs npm test before any git push, blocks the push if a test fails or if the push changes existing tests, and shows the last result above the prompt",
+  "author": { "name": "Sean Johnson" },
+  "license": "MIT",
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "testChanges": {
+      "type": "string",
+      "title": "Pushes that change existing tests",
+      "description": "block holds a push whose commits remove lines from, delete or rename a test file until you type /push-guard allow; warn lets it through with a note; off does not look.",
+      "default": "block",
+      "options": ["block", "warn", "off"]
+    }
+  }
+}
