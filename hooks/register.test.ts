@@ -56,7 +56,55 @@ for (const [name, packageJson] of [
   })
 }
 
-const BAND = { plugin: 'push-guard', component: 'AbovePrompt', props: { hasSurvey: false } } as const
+const SESSION = '/work/shop'
+
+for (const [command, folder] of [
+  ['git -C sub push', `${SESSION}/sub`],
+  ['git -C /abs/path push origin main', '/abs/path'],
+  ['git -C "dir with space" push', `${SESSION}/dir with space`],
+  ["git -C 'dir with space' push", `${SESSION}/dir with space`],
+  ['git -C sub -C inner push', `${SESSION}/sub/inner`],
+  ['git -C sub -C /abs/path push', '/abs/path'],
+  ['cd sub && git push', `${SESSION}/sub`],
+  ['cd sub; git push', `${SESSION}/sub`],
+  ['npm run build; cd "dir with space" && git -C inner push', `${SESSION}/dir with space/inner`],
+] as const) {
+  test(`${command} reads package.json and runs npm test in ${folder}`, async ($, on) => {
+    const reads: string[] = []
+    const cwds: unknown[] = []
+    on('session.cwd', () => ({ value: SESSION }))
+    on('fs.read', (_, e) => { reads.push(e.path); return { value: WITH_TESTS } })
+    on('process.run', (_, e) => { cwds.push(e.init?.cwd); return { value: PASSING } })
+    on('ui.status', () => ({ value: undefined }))
+    on('tool.call', () => ({ result: { text: 'pushed' } }))
+
+    const ran = await $.tool.call({ tool: 'Bash', command })
+
+    expect(ran.deny).toBeUndefined()
+    expect(reads).toEqual([`${folder}/package.json`])
+    expect(cwds).toEqual([folder])
+  })
+}
+
+for (const command of ['git push', 'git -C . push', 'cd $PROJECT && git push', 'git -C ~/shop push']) {
+  test(`${command} reads package.json and runs npm test in the session's folder`, async ($, on) => {
+    const reads: string[] = []
+    const cwds: unknown[] = []
+    on('fs.read', (_, e) => { reads.push(e.path); return { value: WITH_TESTS } })
+    on('process.run', (_, e) => { cwds.push(e.init?.cwd); return { value: PASSING } })
+    on('ui.status', () => ({ value: undefined }))
+    on('tool.call', () => ({ result: { text: 'pushed' } }))
+
+    await $.tool.call({ tool: 'Bash', command })
+
+    expect(reads.length).toBe(1)
+    expect(reads[0].endsWith('/package.json')).toBe(true)
+    expect(reads[0]).not.toContain(SESSION)
+    expect(cwds).toEqual([undefined])
+  })
+}
+
+const BAND ={ plugin: 'push-guard', component: 'AbovePrompt', props: { hasSurvey: false } } as const
 
 for (const [name, run, want] of [
   ['the band counts failing tests', FAILING, 'push-guard: 1 test failing'],

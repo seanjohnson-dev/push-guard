@@ -6,6 +6,8 @@ A Claude Code plugin that runs `npm test` before Claude runs any `git push`.
 - If the tests pass, the push goes ahead.
 - If the project has no npm tests (no `package.json`, no `test` script, or the
   placeholder script `npm init` writes), the push goes ahead without running anything.
+- `git -C <dir> push` and `cd <dir> && git push` are checked in `<dir>`, the project being pushed.
+  If the folder is written with `~` or a `$VARIABLE`, the session's folder is checked instead.
 - The last result shows above the prompt: `push-guard: all tests passing` or
   `push-guard: 2 tests failing`.
 
