@@ -1,0 +1,5 @@
+{
+  "name": "push-guard",
+  "owner": { "name": "Sean Johnson" },
+  "plugins": [{ "name": "push-guard", "source": "./" }]
+}
