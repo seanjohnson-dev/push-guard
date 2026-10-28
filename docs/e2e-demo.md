@@ -271,9 +271,9 @@ Baseline ran `npm test` (a whole command it can't read per test) and said it pas
 took that as a pass and did not run it again. Baseline got `--timeout 45`, stopped `test:api` itself, and
 exited 2 with "the test command timed out on head"; push-guard blocked without a second wait. In (i')
 (no Baseline) the same deny came from Claude Code stopping `npm run test:api` at 60 s; the line reads
-`npm run test:api did not finish within 1 minute (watch mode? a hung test?). Run it yourself ...`. That
-deny is the multi-script form from before a wording fix; the current code says "so the push was blocked"
-once, in the first line (unit tests check it).
+`npm run test:api did not finish within 1 minute (watch mode? a hung test?). Run it yourself ...`. Run
+(i) was made just before a wording fix, which is why its deny says "so the push was blocked" twice; (i')
+ran on the current code, which says it once, in the first line.
 
 **(ii)** the deny:
 
