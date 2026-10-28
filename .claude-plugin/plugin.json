@@ -43,10 +43,8 @@
     "timeoutMinutes": {
       "type": "number",
       "title": "Time limit per script (minutes)",
-      "description": "How long each test or check script may take, Baseline and the plain run together (1 to 15; one command runs 10 minutes at most). A script that does not finish in time blocks the push.",
-      "default": 5,
-      "min": 1,
-      "max": 15
+      "description": "How long each test or check script may take, Baseline and the plain run together. 1 to 15 (a value outside is brought into that range; one command runs 10 minutes at most). A script that does not finish in time blocks the push.",
+      "default": 5
     },
     "suites": {
       "type": "string",

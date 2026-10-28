@@ -206,10 +206,10 @@ async function runFor($: any, argv: string[], dir: string | undefined, ms: numbe
   }
 }
 
-// What a command that did not finish is told, without the leading "push-guard: "
-const didNotFinish = (command: string, ms: number, total: number) =>
+// What a command that did not finish is told, without the leading "push-guard: "; `blocked` when it is the whole message
+const didNotFinish = (command: string, ms: number, total: number, blocked = true) =>
   `${command} did not finish within ${minutes(ms)}${ms < total - 30_000 ? ` (what was left of the ${minutes(total)} budget after Baseline)` : ''} ` +
-  '(watch mode? a hung test?), so the push was blocked. Run it yourself to see why, or raise the `timeoutMinutes` option.'
+  `(watch mode? a hung test?)${blocked ? ', so the push was blocked' : ''}. Run it yourself to see why, or raise the \`timeoutMinutes\` option.`
 
 // ── Which scripts run ──────────────────────────────────────────────────────────────────────────────
 // `npm test` may not cover the whole project: a `test:api` beside it, workspaces, an api/ folder with its
@@ -622,7 +622,7 @@ async function guard($: any, e: any, next: any, options: any, pkg: any, dir: str
       'timedOut' in o ? 'did not finish' : failedOutcomes.includes(o) ? 'failed' : 'report' in o && o.report.red.length ? `had only ${checks ? 'errors' : 'failures'} from before this push` : 'passed'
     const ranList = [...outcomes.map(o => `${o.unit.label} ${how(o)}`), ...skipped.map(u => `${u.label} not run (the push was blocked already)`)].join(', ')
     const sections = failedOutcomes.map(o => {
-      if ('timedOut' in o) return didNotFinish(o.timedOut, o.ms, total)
+      if ('timedOut' in o) return didNotFinish(o.timedOut, o.ms, total, false)
       if ('report' in o) {
         return checks
           ? newErrors(o.unit.script!, o.report)

@@ -513,7 +513,9 @@ test('check scripts run with CI=true and an empty stdin too', async ($, on) => {
   expect(r.inits).toEqual([0, 1].map(() => ({ cwd: '/work/site', timeoutMs: 300_000, env: { CI: 'true' }, stdin: '' })))
 })
 
-for (const [value, ms] of [[1, 60_000], ['2', 120_000], [15, 600_000], [40, 600_000], ['soon', 300_000], [0, 300_000]] as const) {
+// A number outside 1 to 15 is brought into it (0 or less: the default); settings with a value that is not a number
+// do not load at all, so a typo can't reach here
+for (const [value, ms] of [[1, 60_000], [2, 120_000], [0.25, 60_000], [15, 600_000], [40, 600_000], [0, 300_000], [-3, 300_000]] as const) {
   test(`timeoutMinutes: ${JSON.stringify(value)} gives npm test ${ms / 1000} s`, { options: { timeoutMinutes: value } }, async ($, on) => {
     const r = repo(on, {})
     await $.tool.call({ tool: 'Bash', command: 'git push' })
@@ -549,7 +551,7 @@ test('a check that does not finish blocks the push; the checks after it are not 
 
   expect(r.npm).toEqual([['run', 'typecheck']])
   expect(ran.deny).toContain('push-guard: npm run typecheck did not finish, so the push was blocked. This project has no `test` script, so push-guard ran its checks instead: npm run typecheck did not finish, npm run lint not run (the push was blocked already).')
-  expect(ran.deny).toContain('npm run typecheck did not finish within 5 minutes (watch mode? a hung test?)')
+  expect(ran.deny).toContain('\n\nnpm run typecheck did not finish within 5 minutes (watch mode? a hung test?). Run it yourself to see why, or raise the `timeoutMinutes` option.\n\nFix these, then push again.')
 })
 
 // ── Which test scripts run ──────────────────────────────────────────────────────────────────────────
