@@ -245,6 +245,18 @@ otherwise it runs the script itself and blocks on any failure:
 
 NEW verdicts block the push whatever the unit. push-guard never decides on its own that a failure is old.
 
+**Chained scripts** (`test:all` = `react-scripts test && jest --config jest.api.config.js && npm run
+check:x`): Baseline (from the release that judges chains) splits the script and judges every part on its
+own; its report says `runner.name` `chain`, lists `runner.parts` (each with `judged`, its own `runner`,
+`exit_code` and `summary`) and puts the part's `index` on each result as `part`. push-guard reads each part
+with the rules above as if it were its own report. A NEW failure in any part whose report holds up blocks
+the push, named with its part (`- part 2 ("jest --config jest.api.config.js"): "api/…": passed 10/10 runs on
+…`), whatever the other parts say. Otherwise the chain is taken only when **every** part was judged and
+every part's report holds up; a part Baseline could not judge (`||`, a pipe, `$(...)`, …: exit 3), a part
+judged only as a whole command that failed, or a result outside the listed parts, and push-guard runs the
+script itself and blocks on any failure. An older Baseline that cut a chained script to its first part
+reported a per-test runner for it; use a Baseline that reports chains (see its changelog).
+
 ### How Baseline is found
 
 Once per session (the answer is kept in the session's state, so a Baseline installed mid-session is

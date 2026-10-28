@@ -735,3 +735,77 @@ test('test:all through Baseline, only pre-existing failures: pushed with a note,
   expect(w.toasts[0]).toContain('push-guard: pushed with 1 test still red, none from this push')
   expect(await band($)).toBe('push-guard: test:all: 0 new, 1 still failing (not yours)')
 })
+
+// A chained test:all, as Baseline reports it: every part judged on its own (runner.parts, `part` per result)
+const CHAIN_PKG = { scripts: { test: 'react-scripts test', 'test:all': 'CI=true react-scripts test --watchAll=false && jest --config jest.api.config.js && npm run check:env', 'check:env': 'node scripts/check.js' } }
+const part = (index: number, command: string, runner: object, exit_code: number, summary: object, over: object = {}) =>
+  ({ index, command, via: 'npm run test:all', cwd: '.', judged: true, problem: '', runner, exit_code, summary, ...over })
+const JEST = { name: 'jest', per_test: true, check: false }
+const chainReport = (exitCode: number, results: object[], parts: object[]) =>
+  report(exitCode, results, { runner: { name: 'chain', command: ['npm', 'run', 'test:all'], per_test: false, check: false, parts }, summary: { tests_total: 12, tests_passed: 11, tests_failed: results.length } })
+const WEB = 'CI=true react-scripts test --watchAll=false', API = 'jest --config jest.api.config.js'
+const okParts = (api: object, apiExit = 0) => [
+  part(1, WEB, JEST, 0, { tests_total: 6, tests_passed: 6, tests_failed: 0 }),
+  part(2, API, JEST, apiExit, api),
+  part(3, 'npm run check:env', { name: 'generic', per_test: false, check: false }, 0, { tests_total: 0 }),
+]
+
+test('chained test:all: a NEW failure in its api part blocks, named with its part', async ($, on) => {
+  const apiNew = { ...API_NEW, part: 2, part_command: API }
+  const w = world(on, { pkg: CHAIN_PKG, check: chainReport(1, [apiNew], okParts({ tests_total: 6, tests_passed: 5, tests_failed: 1 }, 1)) })
+
+  const ran = await $.tool.call({ tool: 'Bash', command: 'git push' })
+
+  expect(w.ran('check').map(r => r.argv.slice(8))).toEqual([['npm', 'run', 'test:all']])
+  expect(w.ran('npm')).toEqual([])
+  expect(w.pushed()).toBe(0)
+  expect(ran.deny).toContain('1 failure is new with this push')
+  expect(ran.deny).toContain('- part 2 ("jest --config jest.api.config.js"): "api/escape.test.js > escapes quotes": passed 10/10 runs on base000')
+})
+
+test('chained test:all: only pre-existing failures in a part, every part judged: pushed with a note', async ($, on) => {
+  const old = { ...PRE, part: 2, part_command: API }
+  const w = world(on, { pkg: CHAIN_PKG, check: chainReport(0, [old], okParts({ tests_total: 6, tests_passed: 5, tests_failed: 1 })) })
+
+  const ran = await $.tool.call({ tool: 'Bash', command: 'git push' })
+
+  expect(ran.deny).toBeUndefined()
+  expect(w.ran('npm')).toEqual([])
+  expect(w.pushed()).toBe(1)
+  expect(w.toasts[0]).toContain('pushed with 1 test still red, none from this push')
+})
+
+test('chained test:all: all parts judged and passing: pushed, not run again', async ($, on) => {
+  const w = world(on, { pkg: CHAIN_PKG, check: chainReport(0, [], okParts({ tests_total: 6, tests_passed: 6, tests_failed: 0 })) })
+  const ran = await $.tool.call({ tool: 'Bash', command: 'git push' })
+  expect(ran.deny).toBeUndefined()
+  expect(w.ran('npm')).toEqual([])
+  expect(w.pushed()).toBe(1)
+})
+
+const UNJUDGED = { id: 'jest x | tee log', kind: 'command', verdict: 'unknown', reason: 'not judged', head: side(0, 0), base: side(0, 0), part: 3, part_command: 'jest x | tee log', judged: false }
+for (const [name, check, why] of [
+  ['a part Baseline could not judge (exit 3)', chainReport(3, [UNJUDGED], [...okParts({ tests_total: 6, tests_passed: 6, tests_failed: 0 }).slice(0, 2), { index: 3, command: 'jest x | tee log', judged: false, problem: 'its output is piped', runner: null, exit_code: null }]), 'exit 3'],
+  ['a clean report missing a part\'s judgement', chainReport(0, [], [part(1, WEB, JEST, 0, { tests_total: 6, tests_passed: 6 }), { index: 2, command: API, judged: false, problem: 'x', runner: null, exit_code: null }]), 'Baseline could not judge part 2'],
+  ['a part judged as a whole command that failed on both sides', chainReport(0, [{ ...PRE, id: 'npm run check:env', kind: 'command', part: 3, part_command: 'npm run check:env' }], okParts({ tests_total: 6, tests_passed: 6 })), 'part 3 ("npm run check:env"): Baseline can\'t tell'],
+  ['a chain report without parts', chainReport(0, [], []), 'lists no parts'],
+] as const) {
+  test(`chained test:all, ${name}: not trusted, the script runs as is and blocks`, async ($, on) => {
+    const w = world(on, { pkg: CHAIN_PKG, check, npm: FAILING })
+    const ran = await $.tool.call({ tool: 'Bash', command: 'git push' })
+    expect(w.ran('npm').map(r => r.argv)).toEqual([['npm', 'run', 'test:all']])
+    expect(w.pushed()).toBe(0)
+    expect(ran.deny).toContain('npm run test:all failed')
+    expect(ran.deny).toContain(why)
+  })
+}
+
+test('chained test:all: NEW in one part blocks even when another part could not be judged', async ($, on) => {
+  const apiNew = { ...API_NEW, part: 2, part_command: API }
+  const parts = [...okParts({ tests_total: 6, tests_passed: 5, tests_failed: 1 }, 1).slice(0, 2), { index: 3, command: 'a | b', judged: false, problem: 'piped', runner: null, exit_code: null }]
+  const w = world(on, { pkg: CHAIN_PKG, check: chainReport(1, [apiNew, { ...UNJUDGED, id: 'a | b' }], parts) })
+  const ran = await $.tool.call({ tool: 'Bash', command: 'git push' })
+  expect(w.ran('npm')).toEqual([])
+  expect(w.pushed()).toBe(0)
+  expect(ran.deny).toContain('1 failure is new with this push')
+})

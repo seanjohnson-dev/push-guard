@@ -345,6 +345,12 @@ function readReport(stdout: string, exitCode: number, range: { head: string; bas
   if (report?.tool !== 'baseline' || report.schema !== 1 || report.exit_code !== exitCode || !Array.isArray(report.results)) return { why: "Baseline's report is not one push-guard reads" }
   if (report.base?.sha !== range.base || report.head?.sha !== range.head) return { why: 'Baseline compared other commits than the ones being pushed' }
   const base = report.base.short ?? range.base.slice(0, 7)
+  if (report.runner?.name === 'chain') return readChain(report, exitCode, base)
+  return readUnits(report, exitCode, base, check)
+}
+
+// One command's results (or one part's of a chain), read as above
+function readUnits(report: any, exitCode: number, base: string, check: boolean) {
   if (report.runner?.per_test !== true) {
     // A whole command that passes on HEAD needs no comparison; any other answer about it can hide failures
     if (exitCode === 0 && !report.results.length) return { base, isNew: [], red: [], unknown: [] }
@@ -380,6 +386,32 @@ function readReport(stdout: string, exitCode: number, range: { head: string; bas
   if (counted > (perError ? listed('check_error') : listed('test') + listed('load_error'))) return { why: 'Baseline counted more failures on HEAD than it gave verdicts for' }
   // A check Baseline read error by error (tsc, eslint, prettier) has no tests to count: passing, it lists nothing
   if (!isNew.length && !red.length && !perError && !(s.tests_passed > 0)) return { why: 'Baseline saw no tests run' }
+  return { base, isNew, red, unknown }
+}
+
+// A chained script (`a && b && npm run c`, e.g. test:all): Baseline judged every part on its own. A NEW
+// failure in a part whose report holds up blocks the push whatever the other parts say; otherwise the
+// chain is trusted only when every part was judged and each part's own report would be trusted
+function readChain(report: any, exitCode: number, base: string) {
+  const parts = report.runner?.parts
+  if (!Array.isArray(parts) || !parts.length) return { why: "Baseline's report of a chained script lists no parts" }
+  if (report.results.some((r: any) => !parts.some((p: any) => p?.index === r.part))) return { why: "Baseline's report of a chained script has a result outside its parts" }
+  const isNew: any[] = [], red: any[] = [], unknown: any[] = []
+  let why = ''
+  for (const p of parts) {
+    const label = `part ${num(p?.index)} (${quote(p?.command)})`
+    if (p?.judged !== true || !p.runner || (p.exit_code !== 0 && p.exit_code !== 1)) {
+      why ||= `Baseline could not judge ${label}${p?.problem ? `: ${quote(p.problem)}` : ''}`
+      continue
+    }
+    const mine = report.results.filter((r: any) => r.part === p.index)
+    const read = readUnits({ ...report, exit_code: p.exit_code, runner: p.runner, summary: p.summary ?? {}, results: mine }, p.exit_code, base, p.runner.check === true)
+    if ('why' in read) { why ||= `${label}: ${read.why}`; continue }
+    isNew.push(...read.isNew); red.push(...read.red); unknown.push(...read.unknown)
+  }
+  if (isNew.length) return { base, isNew, red, unknown }
+  if (why) return { why }
+  if (exitCode !== 0 || unknown.length) return { why: `Baseline exited ${exitCode} for the chained script but named no new failure` }
   return { base, isNew, red, unknown }
 }
 
@@ -443,7 +475,8 @@ function newFailureLines(report: Report) {
   const lines = report.isNew.map(r => {
     const base = r.base?.runs ? `passed ${r.base.passed}/${r.base.runs} runs on ${report.base}` : `not on ${report.base} (new in this push)`
     const what = r.kind === 'load_error' ? `fails to load on HEAD (${plural(r.head.failed, 'run')})` : `fails ${r.head.failed}/${r.head.runs} runs on HEAD`
-    return `- ${quote(r.id)}: ${base}, ${what}: ${quote(String(r.head.message || r.head.error).split('\n')[0])}`
+    const part = r.part ? `part ${num(r.part)} (${quote(r.part_command)}): ` : ''
+    return `- ${part}${quote(r.id)}: ${base}, ${what}: ${quote(String(r.head.message || r.head.error).split('\n')[0])}`
   })
   const others = report.red.length ? `\n\nAlso still failing, not because of this push: ${countRed(report)}. Those do not block the push.` : ''
   const unknown = report.unknown.length ? `\n\nBaseline could not compare ${plural(report.unknown.length, 'more failing test')} with ${report.base}: ${report.unknown.map(r => quote(r.id)).join(', ')}.` : ''

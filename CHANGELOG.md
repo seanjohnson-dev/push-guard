@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- Fixed: a chained `test:all` (`react-scripts test && jest --config jest.api.config.js && npm run check:x`)
+  could be pushed with a break in a later part when Baseline reported only the first part clean. push-guard
+  now reads Baseline's chain report (`runner.name` `chain`, `runner.parts`, `part` on each result) part by
+  part with the same rules as any report: a NEW failure in any trusted part blocks (listed with its part),
+  and the chain is let through only when every part was judged and every part's report holds up;
+  otherwise the script runs as is and blocks on any failure. Tests: 8 new in `hooks/baseline.test.ts`.
+
 ## 0.5.0
 
 - New: with Baseline installed, a push is blocked only by test failures it caused. push-guard runs
