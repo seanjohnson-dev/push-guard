@@ -237,3 +237,75 @@ on the note:
 > Push-guard let the push go ahead without checking anything. It said `package.json` has no `test`
 > script and none of the scripts it falls back to: `typecheck`, `type-check`, `tsc`, `lint`, `check` or
 > `format:check`. So no tests, type check or lint ran on this commit.
+
+## Never hanging, and the whole project's tests (28 Oct 2026)
+
+Same setup as above (`claude -p`, Claude Code 2.1.300, `--model opus --effort high`, push-guard from this
+folder, other `git push` plugins off), **with `CI` unset**, as in a normal session. Small throwaway npm
+projects in `/tmp/pgl/<name>` (Node 24, `node:test`), each with a local bare remote and one unpushed
+commit; the scripts (`setup.sh`, `e2e.sh`, `show.py`), transcripts and debug logs stay in `/tmp/pgl`.
+The prompt is the one above, with `git push`.
+
+| | Project | Options | Result | Hook time |
+|---|---|---|---|---|
+| (i) | `hang`: `test` = a script that watches forever unless `CI=true` (like Create React App); `test:api` = a script that never ends | `timeoutMinutes: 1`, Baseline on `PATH` | **blocked**: `npm test` passed (it got `CI=true`), `test:api` did not finish | 45.7 s |
+| (i') | same | `timeoutMinutes: 1`, `baseline: off` | **blocked** the same way, by Claude Code's own run timeout | 60.2 s |
+| (ii) | `apionly`: `test` (web) green, `test:api` broken by the push (an HTML-escaping helper writes `&#34;`), plus a `test:e2e` | Baseline on `PATH` | **blocked**, only the NEW api test listed | 2.8 s |
+| (iii) | `nested`: root `test` green, `api/package.json` with its own `test` | Baseline on `PATH` | **pushed**, with a loud "NOT run" note | 1.0 s |
+| (iv) | `green`: `test` and `test:api` both green | Baseline on `PATH` | **pushed**, nothing said | 1.1 s |
+
+Before this change, (i) would have waited 10 minutes for Baseline and then 10 more for `npm test` (the
+watch script never exits), and (ii) would have pushed, because `npm test` doesn't run the api tests.
+
+**(i)** what Claude got (the deny):
+
+```
+push-guard: npm run test:api did not finish, so the push was blocked. push-guard ran: npm test passed, npm run test:api did not finish.
+
+npm run test:api (run by Baseline) did not finish within 1 minute (watch mode? a hung test?), so the push was blocked. Run it yourself to see why, or raise the `timeoutMinutes` option.
+
+Fix these, then push again.
+```
+
+Baseline ran `npm test` (a whole command it can't read per test) and said it passed on `HEAD`; push-guard
+took that as a pass and did not run it again. Baseline got `--timeout 45`, stopped `test:api` itself, and
+exited 2 with "the test command timed out on head"; push-guard blocked without a second wait. In (i')
+(no Baseline) the same deny came from Claude Code stopping `npm run test:api` at 60 s; the line reads
+`npm run test:api did not finish within 1 minute (watch mode? a hung test?). Run it yourself ...`. That
+deny is the multi-script form from before a wording fix; the current code says "so the push was blocked"
+once, in the first line (unit tests check it).
+
+**(ii)** the deny:
+
+```
+push-guard: npm run test:api failed, so the push was blocked. push-guard ran: npm test passed, npm run test:api failed.
+
+npm run test:api: 1 failure is new with this push (not failing on ab68d90, the commit it builds on; Baseline ran each failing test on both commits):
+- "escapes quotes": passed 10/10 runs on ab68d90, fails 5/5 runs on HEAD: "Expected values to be strictly equal:"
+
+Fix these, then push again. The new failures come from this push: do not call them pre-existing.
+```
+
+`test:e2e` was not run (its name says end-to-end).
+
+**(iii)** the push went ahead; the toast (debug log) and the note Claude got and repeated:
+
+```
+push-guard ran npm test; these test scripts were NOT run: api (api/package.json: test)
+```
+
+Claude's answer: "push-guard only ran the root `npm test`. It did not run the separate test script in the
+`api` package (`api/package.json`), so the `api` code in this push hasn't been tested."
+
+**(iv)** pushed; Claude: "push-guard said nothing." (Baseline ran both scripts, exit 0.)
+
+### A real Create React App project (not a live session)
+
+A private Create React App + serverless project: `test` = `react-scripts test` (watch mode without
+`CI=true`, web suite only), `test:api` = the api jest suite, `test:all` = both plus two safety scripts.
+Earlier, a push that broke only an api helper went through silently, and without `CI` the push waited
+about 20 minutes. push-guard now picks `npm run test:all` there. Run as push-guard runs it, in a scratch
+clone with `CI` unset in the shell (`CI=true` added, stdin closed), on the api-only break: it finished in
+22 s with exit 1 (web 2,333 tests green; api `1 failed, 679 passed`), so the push would be blocked. The
+sixth live session meant for this project was lost to a bug in my run script: it started in a folder with
+no repository, so there is no live transcript for it.

@@ -27,6 +27,33 @@
   unchanged.
 - Limits: npm `test` scripts that run vitest, jest or another runner Baseline reads per test only;
   flaky and environment failures go through. See "With Baseline" in the README.
+- Fixed: a push could hang for 20 minutes. `npm test` in Create React App (and jest/vitest watch scripts)
+  waits for input unless `CI=true`, and push-guard waited 10 minutes for Baseline and then 10 more for
+  `npm test`. Every command push-guard runs (tests, checks, Baseline) now gets `CI=true` and an empty,
+  closed stdin. New option `timeoutMinutes` (default 5, 1 to 15): one budget per script for Baseline and
+  the plain run together. Baseline gets `--timeout` just under it. A script that doesn't finish blocks
+  the push with `push-guard: <command> did not finish within N minutes (watch mode? a hung test?), so the
+  push was blocked. Run it yourself to see why, or raise the timeoutMinutes option.`; if Baseline used up
+  the time, the script is not run a second time.
+- Fixed: a push that broke only code `npm test` doesn't cover went through silently. With the new option
+  `suites` at `auto` (default), push-guard runs `test:all` when `package.json` has one, instead of `test`;
+  otherwise `test` plus the `test:*` scripts that look like suites (not watch, e2e, UI, coverage, snapshot,
+  device or benchmark ones, nor ones `test` already runs); with npm workspaces also
+  `npm test --workspaces --if-present`. With Baseline, each runs as its own `baseline check`. A folder
+  one or two levels down (`api/`, `packages/*`, `apps/*`) with a `test` script nothing ran is named in a
+  toast, a note to Claude, the deny and the line above the prompt:
+  `push-guard ran npm test; these test scripts were NOT run: api (api/package.json: test)`. `suites: root`
+  runs only `npm test` and names the suites it left out.
+- Baseline reports are trusted less: a verdict that lets a push through must be about one test, load
+  error or (for a parsed check) check error. Whole-command, `(command)` and `(test session)` verdicts,
+  units of the wrong kind for the runner, and reports whose summary counts more failures on `HEAD`
+  than they give verdicts for make push-guard run the script itself (blocking on any failure). A
+  whole-command report that says the command passed is taken as a pass, so it isn't run twice. The rules
+  are in "How it decides" in the README.
+- Messages name every script that ran and how it came out (`push-guard ran: npm test passed, npm run
+  test:api failed.`); the nothing-checked toast names the `test:*` scripts it found and did not run.
+- Tests now run with `claude plugin test` (157 pass); three "no test script" tests had a fixture that
+  still gave them a `test` script.
 
 ## 0.4.0
 

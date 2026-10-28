@@ -1,6 +1,8 @@
 # push-guard
 
-A Claude Code plugin that runs `npm test` before Claude runs any `git push`.
+A Claude Code plugin that runs the project's tests before Claude runs any `git push`: `npm test`,
+or `npm run test:all` when the project has one, plus the `test:*` suites beside `test` (see
+[What runs, and for how long](#what-runs-and-for-how-long)).
 
 - If a test fails, the push is blocked and Claude is told which tests failed.
   With Baseline installed, only a failure this push caused blocks it (see [With Baseline](#with-baseline)).
@@ -13,10 +15,71 @@ A Claude Code plugin that runs `npm test` before Claude runs any `git push`.
   If the folder is written with `~` or a `$VARIABLE`, the session's folder is checked instead.
 - If the tests pass but the push changes existing tests, the push is held until you OK it
   (see below).
+- Nothing it runs can wait for a person: every command gets `CI=true` and an empty stdin, so jest,
+  vitest and Create React App run once instead of watching. A script that still has not finished after
+  5 minutes (the option `timeoutMinutes`) blocks the push, saying so.
 - The last result shows above the prompt: `push-guard: all tests passing` or
-  `push-guard: 2 tests failing` (for checks: `push-guard: typecheck, lint passing`).
+  `push-guard: 2 tests failing` (for checks: `push-guard: typecheck, lint passing`; for more than one
+  test script: `push-guard: test, test:api passing`).
 
 It only checks pushes Claude makes. Pushes you type in your own terminal are not checked.
+
+## What runs, and for how long
+
+`npm test` often does not cover the whole project: a `test:api` beside it for the serverless code,
+npm workspaces, an `api/` folder with its own `package.json`. With the option `suites` at `auto` (the
+default), push-guard runs, in the folder being pushed:
+
+1. `npm run test:all`, if `package.json` has it: the project's own "everything" script, **instead of**
+   `npm test`;
+2. otherwise `npm test` and each `test:*` script that looks like a suite (`test:api`, `test:unit`,
+   `test:integration`, ...), as `npm run <script>`. Left out: names with `watch`, `e2e`, `ui`, `playwright`,
+   `cypress`, `storybook`, `coverage`, `update`, `snapshot`, `dev`, `ios`, `android`, `native`, `visual`,
+   `bench` or `lint-staged` in them, scripts with `--watch`, and suites the `test` script already runs
+   (`npm run test:unit` or `test:*` in it). With no `test` script, the suites alone run as the tests;
+3. with `workspaces` in `package.json`, also `npm test --workspaces --if-present`, unless the scripts above
+   already run the workspaces (`--workspaces`, `-ws`, turbo, lerna, nx, `pnpm -r`).
+
+push-guard does not run a nested project's tests on its own. When a folder one level down (`api/`) or
+in `packages/`, `apps/`, `services/`, `libs/`, `modules/` or `functions/` has a `package.json` with a
+`test` script that none of the above covers (a workspace run, or a script that names the folder, like
+`cd api && npm test`), you get a toast, Claude gets a note, and the line above the prompt says so:
+
+```
+push-guard ran npm test; these test scripts were NOT run: api (api/package.json: test)
+```
+
+When a push is blocked, the message lists every script that ran and how it came out
+(`push-guard ran: npm test passed, npm run test:api failed.`), then the failures of each one that failed.
+
+**Never waiting.** Every command push-guard runs (the tests, the checks, Baseline) gets `CI=true` and an
+empty, closed stdin. Each script then has `timeoutMinutes` (5 by default, 1 to 15) for Baseline and, if
+Baseline gives no answer, the plain run together; Claude Code itself stops any one command after 10
+minutes. A script that has not finished by then blocks the push:
+
+```
+push-guard: npm test did not finish within 5 minutes (watch mode? a hung test?), so the push was blocked.
+Run it yourself to see why, or raise the `timeoutMinutes` option.
+```
+
+If Baseline used up the time, the script is not run again; if Baseline gave up early, the plain run gets
+what is left, at least a minute. After a script that did not finish, the scripts after it are not run
+(the push is blocked already). `CI=true` also changes what some tools do: jest refuses to write new
+snapshots, for one, which is what a pre-push check wants.
+
+### Options
+
+| Option | Values | Default | What it does |
+|---|---|---|---|
+| `testChanges` | `block`, `warn`, `off` | `block` | a push that changes existing tests waits for `/push-guard allow`, goes through with a note, or is not looked at |
+| `baseline` | `auto`, `off` | `auto` | run the tests through Baseline when it is installed, so only failures this push caused block it |
+| `checks` | `auto`, `all`, `off` | `auto` | with no `test` script, run the typecheck, lint and format scripts instead (`all`: also `build`; `off`: nothing) |
+| `suites` | `auto`, `root` | `auto` | `auto`: `test:all`, or `test` plus its `test:*` suites, plus workspaces; `root`: only `npm test` (the scripts it leaves out are named, loudly) |
+| `timeoutMinutes` | 1 to 15 | 5 | how long each script may take, Baseline and the plain run together; a number outside is brought into the range (a value that is not a number stops Claude Code loading the plugin, so push-guard would be off) |
+
+Set them in Claude Code's plugin settings (`/plugin`), or in `settings.json` under
+`"pluginConfigs": { "push-guard": { "options": { "timeoutMinutes": 10 } } }`. A mistyped `testChanges`,
+`checks` or `suites` value counts as the safe default.
 
 ## Pushes that change tests
 
@@ -77,7 +140,7 @@ push-guard runs whichever of these scripts it has, in this order:
 
 `typecheck`, `type-check`, `tsc`, `lint`, `check`, `format:check`
 
-each as `npm run <script>`, in the folder being pushed (10 minutes at most each). `build` is not run:
+each as `npm run <script>`, in the folder being pushed (within `timeoutMinutes` each, with `CI=true`). `build` is not run:
 it is often slow and may write files or deploy. Set the option `checks` to `all` to run it too, last.
 
 - **Without Baseline**, any check that exits non-zero blocks the push. Claude is told which checks
@@ -94,7 +157,8 @@ it is often slow and may write files or deploy. Set the option `checks` to `all`
   verdict, and any of the other reasons under [When Baseline is not used](#when-baseline-is-not-used).
 - A script npm can't find (`Missing script`) is skipped and never blocks.
 - **If there is none of these scripts**, the push goes ahead, but loudly. You get the toast
-  `push-guard: nothing was checked: this project has no test, typecheck or lint script` and the line
+  `push-guard: nothing was checked: this project has no test, typecheck or lint script` (naming any
+  `test:*` scripts it found and does not run, such as `test:e2e`) and the line
   `push-guard: nothing checked (no test, typecheck or lint script)` above the prompt. Claude gets a note on
   the push's result that nothing was checked, so it tells you.
 - push-guard does not make up a test command. A project with `node:test` files but no `test` script
@@ -103,7 +167,7 @@ it is often slow and may write files or deploy. Set the option `checks` to `all`
 
 The option `checks`: `auto` (the default; a mistyped value counts as `auto`), `all` (also `build`),
 or `off` (as before: a project with no `test` script is pushed with nothing run and nothing said).
-A project that has a `test` script is not affected: only `npm test` runs, as before.
+A project that has a `test` script (or `test:all`, or a `test:*` suite) runs its tests instead, as above.
 
 ## With Baseline
 
@@ -120,7 +184,9 @@ failures **this push caused**.
 | NEW and old failures together | blocked, all listed | blocked, only the NEW ones listed, the others counted |
 | Baseline can't say (see below) | blocked | blocked, as without Baseline, with one line saying why Baseline wasn't used |
 
-How it runs: `baseline check --json --base <B> -- npm test`, in the folder being pushed. `<B>` is what
+How it runs: `baseline check --json --base <B> --timeout <s> -- npm test` (or `-- npm run <script>`, once
+per script push-guard runs; any one that says NEW blocks the push), in the folder being pushed, with
+`CI=true`. `<s>` is the time budget less 15 seconds, so Baseline stops a hung test command itself. `<B>` is what
 the push builds on: where `HEAD` left its upstream (on a new branch, the remote's default branch), the
 same commits the test-changes check looks at. Not Baseline's own default, which on `main` with a clean
 tree would compare `HEAD` with itself.
@@ -138,20 +204,46 @@ failures are old ones.
 
 ### When Baseline is not used
 
-push-guard runs `npm test` as it always did, and any failing test blocks the push, when:
+push-guard runs the script itself as it always did, and any failing test blocks the push, when:
 
 - the option `baseline` is `off`, or Baseline isn't found (then nothing at all changes, not even a note);
 - there is nothing new to push (`HEAD` is already on the upstream), or no upstream or remote default
   branch to compare with (a first push);
 - Baseline exits 2 (it couldn't run the tests) or 3 (no trusted result on the base commit), says
-  UNKNOWN for a test, prints something other than its JSON report, crashes or takes over 10 minutes;
-- Baseline can't tell the tests apart (see Limits) and would only judge the whole command;
-- the report doesn't hold together: it compares other commits than the push's, its exit code and verdicts
-  disagree, or a verdict that would let the push through lacks the runs that show it (a pre-existing
-  failure with no failing run on the base commit, a flaky test that never passed, an environment
-  failure with no environment class). push-guard never decides on its own that a failure is old.
+  UNKNOWN for a test, prints something other than its JSON report, or does not start;
+- Baseline can't tell the tests apart (see Limits) and would only judge the whole command, or the report
+  fails any of the rules under [How it decides](#how-it-decides).
 
-The block then ends with a line saying why Baseline wasn't used.
+The block then ends with a line saying why Baseline wasn't used. The plain run gets what is left of the
+time budget (at least a minute). If Baseline itself does not finish in time, or stops the test command
+at its `--timeout`, the push is blocked as not finished, without a second wait.
+
+### How it decides
+
+A push goes ahead past a failing test only on Baseline's word, and only when the report holds together.
+push-guard reads `baseline check --json` (schema 1) and takes its verdicts only if **all** of these hold;
+otherwise it runs the script itself and blocks on any failure:
+
+1. the report is Baseline's (`tool`, `schema` 1), its `exit_code` is the process's, and it compares
+   exactly the push's commits (`base.sha`, `head.sha`);
+2. `runner.per_test` is `true`. A report that judges the whole command (`generic`) is only taken when it
+   says the command **passed** on `HEAD` (exit 0, no results): nothing to compare then. Any other
+   whole-command answer, NEW, ENVIRONMENT or UNKNOWN, is not used, because one verdict for a whole command
+   can hide failures this push caused (a suite that fails on both commits for an environment reason, and
+   a new one beside it);
+3. each verdict that lets the push through (`pre_existing`, `pre_existing_error_changed`, `flaky`,
+   `environment`) is about **one unit**: a `test` or `load_error` from a test runner, or a `check_error`
+   from a check Baseline parsed error by error (`runner.check` true: tsc, eslint, `prettier --check`,
+   `next build`, and only for a project's check scripts). A `command` unit, `(command)` (a check whose
+   output Baseline could not parse) or `(test session)` (the runner crashed) is a whole, and is not taken;
+4. that verdict has the runs to show for it: failing on both commits (ENVIRONMENT also needs an
+   environment class), or passing and failing on the same commit for FLAKY;
+5. every failure Baseline counted on `HEAD` has a verdict: `summary.tests_failed` + `summary.load_errors`
+   (for checks, `summary.check_errors`) is not more than the results it lists. A failure left out could be new;
+6. the exit code fits the verdicts: exit 1 names a NEW failure, exit 0 names no NEW or UNKNOWN one, and a
+   passing test report saw tests pass.
+
+NEW verdicts block the push whatever the unit. push-guard never decides on its own that a failure is old.
 
 ### How Baseline is found
 
@@ -169,10 +261,11 @@ The option `baseline`: `auto` (the default) uses Baseline when it is found; `off
 
 ### Limits
 
-- For tests, Baseline reads results per test when the `test` script is a plain call to a runner it
-  knows (`vitest run`, `jest`, `pytest`, ...). A script with `&&`, a pipe or `VAR=value` in front, or a runner it doesn't know (`node --test`, mocha,
-  tap, ava) gets a whole-command answer, which push-guard doesn't use: those projects block on any
-  failure, as before.
+- For tests, Baseline reads results per test when the script is a plain call to a runner it
+  knows (`vitest run`, `jest`, `node --test`, `pytest`, ...). A script with `&&`, a pipe or `VAR=value` in
+  front, Create React App's `react-scripts test`, or a runner it doesn't know (mocha, tap, ava) gets a
+  whole-command answer, which push-guard only uses when the command passed: those projects block on
+  any failure, as before. A `test:all` that chains suites is such a script.
 - For checks (a project with no `test` script), an error counts as old when the same file, code and
   message is reported on the base commit. The line number is not compared, so moving code doesn't make
   an error new, but a second identical error in the same file does. A check that fails on both commits
@@ -184,8 +277,8 @@ The option `baseline`: `auto` (the default) uses Baseline when it is found; `off
   module or tool. So does **PRE-EXISTING (error changed)**: the test was red before but now fails
   differently, so the push may have made it worse. Both are named in the toast and to Claude.
 - The verdicts rest on reruns (by default 5 on `HEAD` and 5 to 10 on the base commit for each failing
-  test), so a push with failing tests takes longer than one `npm test`. If Baseline then fails or times
-  out, `npm test` runs once more.
+  test), so a push with failing tests takes longer than one `npm test`. If Baseline then gives no answer,
+  the script runs once more, within what is left of `timeoutMinutes`.
 - Baseline runs the tests on the working tree, so uncommitted changes count, as they did before. The
   base commit runs in a temporary git worktree, and Baseline keeps a cache under `.git/baseline/`.
 - Baseline's own limits apply: see its `docs/VERDICTS.md` (a flaky test that passes in the full run is
