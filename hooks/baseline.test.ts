@@ -59,11 +59,12 @@ type World = {
   env?: Record<string, string>
   installed?: object // plugins/installed_plugins.json
   exists?: string[]
+  clock?: { now: number } // the time `$.clock.now()` reads; an answer may move it (a run that took that long)
 }
 
 // A project with npm tests, git beneath it, and Baseline at BIN on PATH (unless `env` says otherwise)
 function world(on: any, w: World = {}) {
-  const runs: { argv: string[]; cwd?: string }[] = []
+  const runs: { argv: string[]; cwd?: string; init?: any }[] = []
   const toasts: string[] = []
   let pushed = 0
   const exists = w.exists ?? [BIN]
@@ -74,12 +75,13 @@ function world(on: any, w: World = {}) {
     if (e.path === '/home/sean/.claude/plugins/installed_plugins.json' && w.installed) return { value: JSON.stringify(w.installed) }
     throw new Error(`ENOENT: ${e.path}`)
   })
+  if (w.clock) on('clock.now', () => ({ value: w.clock!.now }))
   on('ui.status', () => ({ value: undefined }))
   on('ui.toast', (_: unknown, e: any) => { toasts.push(e.text ?? String(e)); return { value: undefined } })
   on('tool.call', () => { pushed++; return { result: { text: 'pushed' } } })
   on('process.run', (_: unknown, e: any) => {
     const argv = e.argv as string[]
-    runs.push({ argv, cwd: e.init?.cwd })
+    runs.push({ argv, cwd: e.init?.cwd, init: e.init })
     const out = (stdout: string, exitCode = 0) => ({ value: { exitCode, stdout, stderr: '' } })
     if (argv[0] === 'npm') return { value: typeof w.npm === 'function' ? w.npm(argv) : w.npm ?? FAILING }
     if (argv[1] === 'version') return { value: w.version ?? { exitCode: 0, stdout: 'baseline 0.1.0\n', stderr: '' } }
@@ -116,7 +118,7 @@ test('a NEW failure blocks the push and is listed with its evidence', async ($, 
   expect(ran.deny).toContain('"test/cart.test.js > adds 15% VAT": passed 10/10 runs on base000, fails 5/5 runs on HEAD: "AssertionError: expected 11000 to be 11500"')
   expect(ran.deny).toContain('do not call them pre-existing')
   expect(w.pushed()).toBe(0)
-  expect(w.ran('check').map(r => r.argv)).toEqual([[BIN, 'check', '--json', '--base', BASE, '--', 'npm', 'test']])
+  expect(w.ran('check').map(r => r.argv)).toEqual([[BIN, 'check', '--json', '--base', BASE, '--timeout', '285', '--', 'npm', 'test']])
   expect(w.ran('npm')).toEqual([]) // Baseline ran the tests; npm test is not run twice
   expect(await band($)).toBe('push-guard: 1 new, 0 still failing (not yours)')
 })
@@ -214,8 +216,8 @@ for (const [name, check, why] of [
   ['exit 2', { exitCode: 2, stdout: '', stderr: 'baseline: test command not found' }, 'could not run the tests (exit 2)'],
   ['exit 130 (interrupted)', { ...report(0, []), exitCode: 130 }, 'Baseline exited 130'],
   ['output that is not JSON', { exitCode: 0, stdout: 'Traceback (most recent call last):', stderr: '' }, "Baseline's output was not JSON"],
-  // A throwing hook stands for the run rejecting (the kit then answers "no implementation"), as a timeout does
-  ['a timeout', () => { throw new Error('process.run: timed out after 600000 ms') }, 'Baseline did not finish ('],
+  // A throwing hook stands for Baseline not starting (the kit then answers "no implementation")
+  ['Baseline not starting', () => { throw new Error('spawn EACCES') }, 'Baseline did not start ('],
   ['a runner it cannot read per test', report(0, [PRE], { runner: { name: 'generic', per_test: false } }), 'can\'t tell this project\'s tests apart (runner: "generic")'],
   ['a report about other commits', report(0, [PRE], { base: { sha: 'other00', short: 'other00' } }), 'compared other commits than the ones being pushed'],
   ['PRE-EXISTING with no failing runs on base', report(0, [{ ...PRE, base: side(10, 0) }]), 'has nothing to show for it'],
@@ -425,7 +427,7 @@ test('no test script: a NEW type error blocks the push, with the error; the old 
 
   const ran = await $.tool.call({ tool: 'Bash', command: 'git push' })
 
-  expect(w.ran('check').map(r => r.argv)).toEqual([[BIN, 'check', '--json', '--base', BASE, '--', 'npm', 'run', 'typecheck']])
+  expect(w.ran('check').map(r => r.argv)).toEqual([[BIN, 'check', '--json', '--base', BASE, '--timeout', '285', '--', 'npm', 'run', 'typecheck']])
   expect(w.ran('npm')).toEqual([]) // Baseline ran the check; it is not run twice
   expect(w.pushed()).toBe(0)
   expect(ran.deny).toContain('push-guard: npm run typecheck failed, so the push was blocked. This project has no `test` script, so push-guard ran its checks instead: npm run typecheck failed.')
@@ -565,4 +567,171 @@ test('no test script: a check with only old errors is named as such when another
   expect(ran.deny).toContain('ran its checks instead: npm run typecheck had only errors from before this push, npm run lint failed.')
   expect(ran.deny).toContain('- "src/a.ts: no-console Unexpected console statement"')
   expect(await band($)).toBe('push-guard: typecheck, lint: 1 new, 1 still failing (not yours)')
+})
+
+// ── What push-guard trusts in a report ─────────────────────────────────────────────────────────────
+// A verdict that lets a push through must be about one test (or one check error) Baseline compared on both
+// commits; one verdict for a whole command can hide failures this push caused
+
+const WHOLE = { ...ENV, id: 'npm test', kind: 'command' }
+for (const [name, check, why] of [
+  // Create React App, read as a whole: head has extra failing suites, one environment-looking error on both sides
+  ['ENVIRONMENT for a whole command (generic runner)', report(0, [WHOLE], { runner: { name: 'generic', command: ['npm', 'test'], per_test: false } }), 'can\'t tell this project\'s tests apart (runner: "generic")'],
+  ['ENVIRONMENT for a whole-command unit in a per-test report', report(0, [WHOLE]), 'Baseline judged "npm test" as a whole'],
+  ['PRE-EXISTING for the whole test session (the runner crashed on both)', report(0, [{ ...PRE, id: '(test session)', kind: 'load_error' }]), 'Baseline judged "(test session)" as a whole'],
+  ['PRE-EXISTING for a check error in a test report', report(0, [{ ...PRE, kind: 'check_error' }]), 'as a whole'],
+  ['more failing tests on HEAD than verdicts', report(0, [PRE], { summary: { tests_total: 9, tests_passed: 5, tests_failed: 4, load_errors: 0 } }), 'counted more failures on HEAD than it gave verdicts for'],
+  ['a load error on HEAD with no verdict', report(0, [PRE], { summary: { tests_total: 6, tests_passed: 5, tests_failed: 1, load_errors: 1 } }), 'counted more failures on HEAD than it gave verdicts for'],
+  ['UNKNOWN in an exit 0 report', report(0, [PRE, UNKNOWN]), 'exited 0 but named new or unknown failures'],
+] as const) {
+  test(`${name}: not trusted, npm test runs and blocks`, async ($, on) => {
+    const w = world(on, { check })
+
+    const ran = await $.tool.call({ tool: 'Bash', command: 'git push' })
+
+    expect(w.ran('npm').length).toBe(1)
+    expect(w.pushed()).toBe(0)
+    expect(ran.deny?.startsWith(ORIGINAL_DENY)).toBe(true)
+    expect(ran.deny).toContain(why)
+  })
+}
+
+test('a whole command Baseline saw pass on HEAD needs no comparison: pushed, not run again', async ($, on) => {
+  const w = world(on, { check: report(0, [], { runner: { name: 'generic', command: ['npm', 'test'], per_test: false }, summary: { tests_total: 1, tests_passed: 1, tests_failed: 0 } }) })
+
+  const ran = await $.tool.call({ tool: 'Bash', command: 'git push' })
+
+  expect(ran.deny).toBeUndefined()
+  expect(w.ran('npm')).toEqual([])
+  expect(w.pushed()).toBe(1)
+})
+
+test('a NEW whole command still blocks only after npm test itself fails', async ($, on) => {
+  const w = world(on, { check: report(1, [{ ...NEW, id: 'npm test', kind: 'command' }], { runner: { name: 'generic', per_test: false } }) })
+  const ran = await $.tool.call({ tool: 'Bash', command: 'git push' })
+  expect(w.ran('npm').length).toBe(1)
+  expect(ran.deny?.startsWith(ORIGINAL_DENY)).toBe(true)
+})
+
+test('no test script: a check Baseline could not parse, `(command)`, is not trusted as pre-existing', async ($, on) => {
+  const unparsed = { ...TS_OLD, id: '(command)', kind: 'command' }
+  const w = world(on, { pkg: { scripts: { lint: 'eslint .' } }, check: checkReport(0, [unparsed], { runner: { name: 'eslint', per_test: true, check: true } }), npm: LINT_FAIL })
+
+  const ran = await $.tool.call({ tool: 'Bash', command: 'git push' })
+
+  expect(w.ran('npm').map(r => r.argv)).toEqual([['npm', 'run', 'lint']])
+  expect(ran.deny).toContain('Baseline judged "(command)" as a whole')
+})
+
+test('no test script: more errors on HEAD than verdicts is not trusted', async ($, on) => {
+  const w = world(on, { pkg: { scripts: { typecheck: 'tsc' } }, check: checkReport(0, [TS_OLD], { summary: { tests_total: 0, tests_passed: 0, tests_failed: 0, check_errors: 3 } }), npm: TSC_FAIL })
+  const ran = await $.tool.call({ tool: 'Bash', command: 'git push' })
+  expect(w.ran('npm').length).toBe(1)
+  expect(ran.deny).toContain('counted more failures on HEAD than it gave verdicts for')
+})
+
+test('no test script: check errors in a report whose runner is not a check are not trusted', async ($, on) => {
+  const w = world(on, { pkg: { scripts: { typecheck: 'tsc' } }, check: checkReport(0, [TS_OLD], { runner: { name: 'vitest', per_test: true, check: false } }), npm: TSC_FAIL })
+  const ran = await $.tool.call({ tool: 'Bash', command: 'git push' })
+  expect(w.ran('npm').length).toBe(1)
+  expect(ran.deny).toContain('as a whole')
+})
+
+// ── Time: one budget for Baseline and the plain run ────────────────────────────────────────────────
+
+test('Baseline runs with CI=true, an empty stdin, its own --timeout and the budget', { options: { timeoutMinutes: 1 } }, async ($, on) => {
+  const w = world(on, { check: report(0, [PRE]) })
+
+  await $.tool.call({ tool: 'Bash', command: 'git push' })
+
+  const [check] = w.ran('check')
+  expect(check.argv).toEqual([BIN, 'check', '--json', '--base', BASE, '--timeout', '45', '--', 'npm', 'test'])
+  expect(check.init).toEqual({ timeoutMs: 60_000, env: { CI: 'true' }, stdin: '' })
+  expect(w.ran('version')[0].init).toEqual({ timeoutMs: 5_000, env: { CI: 'true' }, stdin: '' })
+})
+
+test('Baseline that does not finish blocks the push; npm test does not get another full wait', async ($, on) => {
+  const clock = { now: 0 }
+  const w = world(on, { clock, check: () => { clock.now += 300_000; throw new Error('timed out') } })
+
+  const ran = await $.tool.call({ tool: 'Bash', command: 'git push' })
+
+  expect(w.ran('npm')).toEqual([])
+  expect(w.pushed()).toBe(0)
+  expect(ran.deny).toBe(
+    'push-guard: baseline check -- npm test did not finish within 5 minutes (watch mode? a hung test?), so the push was blocked. ' +
+      'Run it yourself to see why, or raise the `timeoutMinutes` option. push-guard ran it with CI=true, so a test runner that watches would have stopped.',
+  )
+})
+
+test('Baseline stopping the test command at its --timeout blocks the push the same way', async ($, on) => {
+  const stopped = { exitCode: 2, stderr: '', stdout: JSON.stringify({ tool: 'baseline', exit_code: 2, error: 'the test command timed out on head (timed out after 285s); raise --timeout' }) }
+  const w = world(on, { check: stopped })
+
+  const ran = await $.tool.call({ tool: 'Bash', command: 'git push' })
+
+  expect(w.ran('npm')).toEqual([])
+  expect(ran.deny).toContain('push-guard: npm test (run by Baseline) did not finish within 5 minutes (watch mode? a hung test?)')
+})
+
+for (const [took, ms] of [[30_000, 270_000], [240_000, 60_000], [299_000, 60_000]] as const) {
+  test(`Baseline gave no answer after ${took / 1000} s: npm test gets ${ms / 1000} s of the 5 minutes`, async ($, on) => {
+    const clock = { now: 0 }
+    const w = world(on, { clock, check: () => { clock.now += took; return report(3, [UNKNOWN]) } })
+
+    await $.tool.call({ tool: 'Bash', command: 'git push' })
+
+    expect(w.ran('npm').map(r => r.init)).toEqual([{ timeoutMs: ms, env: { CI: 'true' }, stdin: '' }])
+  })
+}
+
+test('the plain run after Baseline that does not finish says how long it had', async ($, on) => {
+  const clock = { now: 0 }
+  world(on, { clock, check: () => { clock.now += 240_000; return report(3, [UNKNOWN]) }, npm: () => { clock.now += 60_000; throw new Error('timed out') } })
+
+  const ran = await $.tool.call({ tool: 'Bash', command: 'git push' })
+
+  expect(ran.deny).toContain('push-guard: npm test did not finish within 1 minute (what was left of the 5 minutes budget after Baseline) (watch mode? a hung test?)')
+})
+
+// ── Each test script through Baseline ──────────────────────────────────────────────────────────────
+
+const SUITES = { scripts: { test: 'react-scripts test', 'test:api': 'jest --config jest.api.config.js' } }
+const API_NEW = { ...NEW, id: 'api/escape.test.js > escapes quotes', head: side(5, 5, 'Expected: "&quot;" Received: "\""') }
+
+test('test and test:api each run through Baseline; a NEW failure in test:api blocks, with how each came out', async ($, on) => {
+  const w = world(on, { pkg: SUITES, check: perScript({ test: report(0, [PRE]), 'test:api': report(1, [API_NEW]) }) })
+
+  const ran = await $.tool.call({ tool: 'Bash', command: 'git push' })
+
+  expect(w.ran('check').map(r => r.argv.slice(8))).toEqual([['npm', 'test'], ['npm', 'run', 'test:api']])
+  expect(w.ran('npm')).toEqual([])
+  expect(w.pushed()).toBe(0)
+  expect(ran.deny).toContain('push-guard: npm run test:api failed, so the push was blocked. push-guard ran: npm test had only failures from before this push, npm run test:api failed.')
+  expect(ran.deny).toContain('npm run test:api: 1 failure is new with this push (not failing on base000, the commit it builds on; Baseline ran each failing test on both commits):\n- "api/escape.test.js > escapes quotes": passed 10/10 runs on base000, fails 5/5 runs on HEAD')
+  expect(ran.deny).toContain('The new failures come from this push: do not call them pre-existing.')
+  expect(await band($)).toBe('push-guard: test, test:api: 1 new, 1 still failing (not yours)')
+})
+
+test('a test script Baseline cannot judge runs as is; the others keep their verdicts', async ($, on) => {
+  const generic = report(0, [WHOLE], { runner: { name: 'generic', per_test: false } })
+  const w = world(on, { pkg: SUITES, check: perScript({ test: generic, 'test:api': report(0, []) }), npm: FAILING })
+
+  const ran = await $.tool.call({ tool: 'Bash', command: 'git push' })
+
+  expect(w.ran('npm').map(r => r.argv)).toEqual([['npm', 'test']])
+  expect(ran.deny).toContain('push-guard: npm test failed, so the push was blocked. push-guard ran: npm test failed, npm run test:api passed.')
+  expect(ran.deny).toContain('npm test failed (exit 1):\n  ✖ adds 15% VAT: expected 11500, got 11000\n1 failing\n(push-guard did not use Baseline: Baseline can\'t tell this project\'s tests apart (runner: "generic").)')
+  expect(await band($)).toBe('push-guard: test failing') // the one that blocked; the message names both
+})
+
+test('test:all through Baseline, only pre-existing failures: pushed with a note, named above the prompt', async ($, on) => {
+  const w = world(on, { pkg: { scripts: { ...SUITES.scripts, 'test:all': 'npm test && npm run test:api' } }, check: report(0, [PRE]) })
+
+  const ran = await $.tool.call({ tool: 'Bash', command: 'git push' })
+
+  expect(w.ran('check').map(r => r.argv.slice(8))).toEqual([['npm', 'run', 'test:all']])
+  expect(ran.deny).toBeUndefined()
+  expect(w.toasts[0]).toContain('push-guard: pushed with 1 test still red, none from this push')
+  expect(await band($)).toBe('push-guard: test:all: 0 new, 1 still failing (not yours)')
 })

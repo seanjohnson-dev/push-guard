@@ -123,23 +123,45 @@ for (const [name, run, want] of [
 const TYPED = { kind: 'composer' }
 
 // A repo beneath the push: npm test passes (or npm answers `npm(args)`), HEAD is `head`, the upstream (or `bases`)
-// meets HEAD at base000, and the pushed commits change `files` (path: [lines added, lines removed])
+// meets HEAD at base000, and the pushed commits change `files` (path: [lines added, lines removed]). `nested`:
+// package.json files one or two folders down (api, packages/ui); `clock`: the time `$.clock.now()` reads, which
+// an npm answer may move (a command that runs past its time)
 type NpmAnswer = { exitCode: number; stdout: string; stderr: string }
-function repo(on: any, files: Record<string, [number, number]>, opts: { head?: string; bases?: string[]; pkg?: object; npm?: (args: string[]) => NpmAnswer } = {}) {
+type RepoOpts = { head?: string; bases?: string[]; pkg?: object; npm?: (args: string[]) => NpmAnswer; nested?: Record<string, object>; clock?: { now: number } }
+function repo(on: any, files: Record<string, [number, number]>, opts: RepoOpts = {}) {
   const git: string[] = []
   const npm: string[][] = []
   const npmCwds: unknown[] = []
+  const inits: any[] = []
   const others: string[][] = []
   const toasts: string[] = []
   const bases = opts.bases ?? ['@{upstream}']
-  on('fs.read', () => ({ value: JSON.stringify({ scripts: { test: 'node --test' }, ...opts.pkg }) }))
+  const nested = opts.nested ?? {}
+  // Every folder on the way to a nested package.json (packages, packages/ui); paths reach the hooks absolute
+  const folders = [...new Set(Object.keys(nested).flatMap(rel => rel.split('/').map((_, i, parts) => parts.slice(0, i + 1).join('/'))))]
+  const under = (path: string, suffix = '') => folders.filter(d => path.endsWith(`/${d}${suffix}`)).sort((a, b) => b.length - a.length)[0]
+  on('fs.read', (_: unknown, e: any) => {
+    const rel = under(e.path, '/package.json')
+    if (rel) {
+      if (rel in nested) return { value: JSON.stringify(nested[rel]) }
+      throw new Error(`ENOENT: no such file or directory, open '${e.path}'`)
+    }
+    return { value: JSON.stringify({ scripts: { test: 'node --test' }, ...opts.pkg }) }
+  })
+  on('fs.list', (_: unknown, e: any) => {
+    const rel = under(String(e.path ?? ''))
+    const prefix = rel ? `${rel}/` : ''
+    const names = new Set(folders.filter(d => d.startsWith(prefix) && !d.slice(prefix.length).includes('/')).map(d => d.slice(prefix.length)))
+    return { value: [...names, 'node_modules', '.git'].map(name => ({ name, kind: 'dir', size: 0, mtimeMs: 0, isLink: false })) }
+  })
+  if (opts.clock) on('clock.now', () => ({ value: opts.clock!.now }))
   on('ui.status', () => ({ value: undefined }))
   on('ui.toast', (_: unknown, e: any) => { toasts.push(e.text ?? e.message ?? String(e)); return { value: undefined } })
   on('tool.call', () => ({ result: { text: 'pushed' } }))
   on('process.run', (_: unknown, e: any) => {
     const [cmd, ...args] = e.argv as string[]
     const out = (stdout: string, exitCode = 0) => ({ value: { exitCode, stdout, stderr: '' } })
-    if (cmd === 'npm') { npm.push(args); npmCwds.push(e.init?.cwd); return opts.npm ? { value: opts.npm(args) } : out('all passing\n') }
+    if (cmd === 'npm') { npm.push(args); npmCwds.push(e.init?.cwd); inits.push(e.init); return opts.npm ? { value: opts.npm(args) } : out('all passing\n') }
     if (cmd !== 'git') { others.push(e.argv); return out('', 127) }
     git.push(args.join(' '))
     if (args[0] === 'rev-parse') return opts.head === '' ? out('', 128) : out(`${opts.head ?? 'abc1234567'}\n`)
@@ -147,7 +169,7 @@ function repo(on: any, files: Record<string, [number, number]>, opts: { head?: s
     if (args[0] === 'diff') return out(Object.entries(files).map(([path, [a, d]]) => `${a}\t${d}\t${path}\0`).join(''))
     return out('', 1)
   })
-  return { git, npm, npmCwds, others, toasts }
+  return { git, npm, npmCwds, inits, others, toasts }
 }
 
 test('a push that edits an expected value in a test is held until you allow it', async ($, on) => {
@@ -394,7 +416,7 @@ test('a mistyped checks value still runs the checks', { options: { checks: 'of' 
 })
 
 for (const [name, pkg] of [
-  ['no test script', { name: 'site' }],
+  ['no test script', { name: 'site', scripts: {} }],
   ['the test script npm init writes', { scripts: { test: 'echo "Error: no test specified" && exit 1' } }],
   ['only scripts that are not checks', { scripts: { dev: 'vite', build: 'vite build', start: 'node server.js' } }],
 ] as const) {
@@ -417,7 +439,7 @@ for (const [name, pkg] of [
 }
 
 test('node:test files but no test script: no command is made up, the push goes through loudly', async ($, on) => {
-  const r = repo(on, { 'test/cart.test.js': [12, 0] }, { pkg: { name: 'site', type: 'module' } })
+  const r = repo(on, { 'test/cart.test.js': [12, 0] }, { pkg: { name: 'site', type: 'module', scripts: {} } })
 
   const ran = await $.tool.call({ tool: 'Bash', command: 'git push' })
 
@@ -457,7 +479,7 @@ test('passing checks: a push that changes a test is still held', async ($, on) =
 })
 
 test('nothing to check: a push that changes a test is still held', async ($, on) => {
-  const r = repo(on, { 'test/cart.test.js': [1, 1] }, { pkg: { name: 'site' } })
+  const r = repo(on, { 'test/cart.test.js': [1, 1] }, { pkg: { name: 'site', scripts: {} } })
 
   const ran = await $.tool.call({ tool: 'Bash', command: 'git push' })
 
@@ -471,4 +493,195 @@ test('git -C dir push runs the checks of dir', async ($, on) => {
   await $.tool.call({ tool: 'Bash', command: 'git -C /work/site push' })
 
   expect(r.npmCwds).toEqual(['/work/site', '/work/site'])
+})
+
+// ── Never hanging: CI=true, no stdin, a time budget ────────────────────────────────────────────────
+
+test('npm test runs with CI=true and an empty stdin, for 5 minutes at most', async ($, on) => {
+  const r = repo(on, {})
+
+  await $.tool.call({ tool: 'Bash', command: 'git push' })
+
+  expect(r.inits).toEqual([{ timeoutMs: 300_000, env: { CI: 'true' }, stdin: '' }])
+})
+
+test('check scripts run with CI=true and an empty stdin too', async ($, on) => {
+  const r = repo(on, {}, { pkg: { scripts: CHECKS }, npm: () => OK })
+
+  await $.tool.call({ tool: 'Bash', command: 'git -C /work/site push' })
+
+  expect(r.inits).toEqual([0, 1].map(() => ({ cwd: '/work/site', timeoutMs: 300_000, env: { CI: 'true' }, stdin: '' })))
+})
+
+for (const [value, ms] of [[1, 60_000], ['2', 120_000], [15, 600_000], [40, 600_000], ['soon', 300_000], [0, 300_000]] as const) {
+  test(`timeoutMinutes: ${JSON.stringify(value)} gives npm test ${ms / 1000} s`, { options: { timeoutMinutes: value } }, async ($, on) => {
+    const r = repo(on, {})
+    await $.tool.call({ tool: 'Bash', command: 'git push' })
+    expect(r.inits[0].timeoutMs).toBe(ms)
+  })
+}
+
+// The kit answers a throwing hook with "no implementation"; with the clock moved past the budget first, that is
+// how a run the engine stopped at its timeout reaches the plugin
+const hangs = (clock: { now: number }, ms: number) => () => { clock.now += ms; throw new Error('timed out') }
+
+test('npm test that does not finish (watch mode) blocks the push, saying so', { options: { timeoutMinutes: 1 } }, async ($, on) => {
+  const clock = { now: 1_000_000 }
+  const r = repo(on, {}, { clock, npm: hangs(clock, 60_000) })
+
+  const ran = await $.tool.call({ tool: 'Bash', command: 'git push' })
+
+  expect(r.npm).toEqual([['test']])
+  expect(ran.deny).toBe(
+    'push-guard: npm test did not finish within 1 minute (watch mode? a hung test?), so the push was blocked. Run it yourself to see why, ' +
+      'or raise the `timeoutMinutes` option. push-guard ran it with CI=true, so a test runner that watches would have stopped.',
+  )
+  const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  expect((await ui.find({ type: 'Text', text: /push-guard/ }))?.text).toBe('push-guard: npm test did not finish')
+  await ui.unmount()
+})
+
+test('a check that does not finish blocks the push; the checks after it are not run', async ($, on) => {
+  const clock = { now: 0 }
+  const r = repo(on, {}, { clock, pkg: { scripts: CHECKS }, npm: hangs(clock, 300_000) })
+
+  const ran = await $.tool.call({ tool: 'Bash', command: 'git push' })
+
+  expect(r.npm).toEqual([['run', 'typecheck']])
+  expect(ran.deny).toContain('push-guard: npm run typecheck did not finish, so the push was blocked. This project has no `test` script, so push-guard ran its checks instead: npm run typecheck did not finish, npm run lint not run (the push was blocked already).')
+  expect(ran.deny).toContain('npm run typecheck did not finish within 5 minutes (watch mode? a hung test?)')
+})
+
+// ── Which test scripts run ──────────────────────────────────────────────────────────────────────────
+
+const API_FAIL = { exitCode: 1, stdout: 'FAIL api/escape.test.js\n  ✕ escapes quotes (3 ms)\n\nTests: 1 failed, 40 passed\n', stderr: '' }
+
+test('test:all is the project\'s own aggregate: it runs instead of test', async ($, on) => {
+  const r = repo(on, {}, { pkg: { scripts: { test: 'react-scripts test', 'test:api': 'jest -c api.js', 'test:all': 'CI=true react-scripts test && jest -c api.js' } } })
+
+  const ran = await $.tool.call({ tool: 'Bash', command: 'git push' })
+
+  expect(r.npm).toEqual([['run', 'test:all']])
+  expect(ran.deny).toBeUndefined()
+  const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  expect((await ui.find({ type: 'Text', text: /push-guard/ }))?.text).toBe('push-guard: test:all passing')
+  await ui.unmount()
+})
+
+test('test runs with the suites beside it; watch, e2e, UI, coverage and suites test already runs are left out', async ($, on) => {
+  const scripts = {
+    test: 'vitest run && npm run test:unit', 'test:unit': 'vitest run unit', 'test:api': 'jest -c api.js', 'test:integration': 'node --test it/',
+    'test:watch': 'vitest', 'test:e2e': 'playwright test', 'test:ui': 'vitest --ui', 'test:coverage': 'vitest run --coverage',
+    'test:update-snapshots': 'vitest -u', 'test:server': 'jest --watch', 'test:quick': 'vitest run quick',
+  }
+  const r = repo(on, {}, { pkg: { scripts } })
+
+  await $.tool.call({ tool: 'Bash', command: 'git push' })
+
+  expect(r.npm).toEqual([['test'], ['run', 'test:api'], ['run', 'test:integration'], ['run', 'test:quick']])
+})
+
+test('a failing test:api blocks the push even though npm test passes, and both are named', async ($, on) => {
+  const r = repo(on, {}, { pkg: { scripts: { test: 'react-scripts test', 'test:api': 'jest -c api.js' } }, npm: args => (args[1] === 'test:api' ? API_FAIL : PASSING) })
+
+  const ran = await $.tool.call({ tool: 'Bash', command: 'git push' })
+
+  expect(r.npm).toEqual([['test'], ['run', 'test:api']])
+  expect(ran.deny).toContain('push-guard: npm run test:api failed, so the push was blocked. push-guard ran: npm test passed, npm run test:api failed.')
+  expect(ran.deny).toContain('npm run test:api failed (exit 1):\nFAIL api/escape.test.js\n  ✕ escapes quotes (3 ms)\nTests: 1 failed, 40 passed')
+  expect(r.git).toEqual([])
+  const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  expect((await ui.find({ type: 'Text', text: /push-guard/ }))?.text).toBe('push-guard: test:api failing')
+  await ui.unmount()
+})
+
+test('all suites green: the push goes through quietly, both named above the prompt', async ($, on) => {
+  const r = repo(on, {}, { pkg: { scripts: { test: 'react-scripts test', 'test:api': 'jest -c api.js' } } })
+
+  const ran = await $.tool.call({ tool: 'Bash', command: 'git push' })
+
+  expect(ran.deny).toBeUndefined()
+  expect(r.toasts).toEqual([])
+  expect((ran as any).context).toBeUndefined()
+  const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  expect((await ui.find({ type: 'Text', text: /push-guard/ }))?.text).toBe('push-guard: test, test:api passing')
+  await ui.unmount()
+})
+
+test('suites: root runs only npm test, and says loudly which test scripts it left out', { options: { suites: 'root' } }, async ($, on) => {
+  const r = repo(on, {}, { pkg: { scripts: { test: 'react-scripts test', 'test:api': 'jest -c api.js', 'test:all': 'x', 'test:watch': 'jest --watch' } } })
+
+  const ran = await $.tool.call({ tool: 'Bash', command: 'git push' })
+
+  expect(r.npm).toEqual([['test']])
+  expect(ran.deny).toBeUndefined()
+  const line = 'push-guard ran npm test; these test scripts were NOT run: test:api (package.json), test:all (package.json)'
+  expect(r.toasts).toEqual([line])
+  expect((ran as any).context?.join('\n')).toContain(`${line}. Tell the user the push went ahead without these tests`)
+  const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  expect((await ui.find({ type: 'Text', text: /push-guard/ }))?.text).toBe('push-guard: all tests passing; NOT run: test:api, test:all')
+  await ui.unmount()
+})
+
+test('npm workspaces: their tests run too', async ($, on) => {
+  const r = repo(on, {}, { pkg: { workspaces: ['packages/*'], scripts: { test: 'vitest run' } } })
+  await $.tool.call({ tool: 'Bash', command: 'git push' })
+  expect(r.npm).toEqual([['test'], ['test', '--workspaces', '--if-present']])
+})
+
+for (const test_ of ['npm test --workspaces', 'turbo run test', 'npm run test -ws']) {
+  test(`npm workspaces with a test script that runs them (${test_}): not run twice`, async ($, on) => {
+    const r = repo(on, {}, { pkg: { workspaces: { packages: ['apps/*'] }, scripts: { test: test_ } } })
+    await $.tool.call({ tool: 'Bash', command: 'git push' })
+    expect(r.npm).toEqual([['test']])
+  })
+}
+
+test('an api/ folder with its own test script that nothing ran: pushed, but loudly', async ($, on) => {
+  const r = repo(on, {}, { pkg: { scripts: { test: 'react-scripts test' } }, nested: { api: { scripts: { test: 'jest' } }, web: { scripts: { build: 'vite build' } }, 'packages/ui': { scripts: { test: 'echo "Error: no test specified" && exit 1' } } } })
+
+  const ran = await $.tool.call({ tool: 'Bash', command: 'git push' })
+
+  expect(r.npm).toEqual([['test']]) // never run on its own
+  expect(ran.deny).toBeUndefined()
+  const line = 'push-guard ran npm test; these test scripts were NOT run: api (api/package.json: test)'
+  expect(r.toasts).toEqual([line])
+  expect((ran as any).context?.join('\n')).toContain(line)
+  const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  expect((await ui.find({ type: 'Text', text: /push-guard/ }))?.text).toBe('push-guard: all tests passing; NOT run: api')
+  await ui.unmount()
+})
+
+test('packages/* and apps/* are looked in; a workspace run or a script naming the folder covers it', async ($, on) => {
+  const nested = { 'packages/ui': { scripts: { test: 'vitest run' } }, 'apps/web': { scripts: { test: 'vitest run' } }, server: { scripts: { test: 'jest' } }, admin: { scripts: { test: 'jest' } } }
+  const r = repo(on, {}, { pkg: { workspaces: ['packages/*'], scripts: { test: 'vitest run', 'test:server': 'cd server && npm test' } }, nested })
+
+  const ran = await $.tool.call({ tool: 'Bash', command: 'git push' })
+
+  expect(r.npm).toEqual([['test'], ['run', 'test:server'], ['test', '--workspaces', '--if-present']])
+  expect(r.toasts).toEqual(['push-guard ran npm test, npm run test:server, npm test --workspaces --if-present; these test scripts were NOT run: apps/web (apps/web/package.json: test), admin (admin/package.json: test)'])
+  expect(ran.deny).toBeUndefined()
+})
+
+test('a blocked push also names the test scripts that were not run', async ($, on) => {
+  repo(on, {}, { pkg: { scripts: { test: 'node --test' } }, nested: { api: { scripts: { test: 'jest' } } }, npm: () => FAILING })
+  const ran = await $.tool.call({ tool: 'Bash', command: 'git push' })
+  expect(ran.deny).toContain('push-guard: npm test failed (exit 1)')
+  expect(ran.deny?.endsWith('\n\npush-guard ran npm test; these test scripts were NOT run: api (api/package.json: test).')).toBe(true)
+})
+
+test('no test script but a test:unit suite: it runs as the project\'s tests', async ($, on) => {
+  const r = repo(on, {}, { pkg: { scripts: { 'test:unit': 'vitest run', lint: 'eslint .' } } })
+  await $.tool.call({ tool: 'Bash', command: 'git push' })
+  expect(r.npm).toEqual([['run', 'test:unit']])
+})
+
+test('nothing checked: the message names the test scripts it found and did not run', async ($, on) => {
+  const r = repo(on, {}, { pkg: { scripts: { 'test:e2e': 'playwright test', 'test:watch': 'vitest' } } })
+
+  const ran = await $.tool.call({ tool: 'Bash', command: 'git push' })
+
+  expect(r.npm).toEqual([])
+  expect(r.toasts).toEqual([`${NOTHING} (it has test:e2e, test:watch, which push-guard does not run before a push)`])
+  expect((ran as any).context?.join('\n')).toContain('It does have test:e2e, test:watch, which push-guard does not run before a push (watch, end-to-end, UI or device suites).')
 })
