@@ -428,7 +428,7 @@ test('no test script: a NEW type error blocks the push, with the error; the old 
   expect(w.ran('check').map(r => r.argv)).toEqual([[BIN, 'check', '--json', '--base', BASE, '--', 'npm', 'run', 'typecheck']])
   expect(w.ran('npm')).toEqual([]) // Baseline ran the check; it is not run twice
   expect(w.pushed()).toBe(0)
-  expect(ran.deny).toContain('push-guard: npm run typecheck failed, so the push was blocked.')
+  expect(ran.deny).toContain('push-guard: npm run typecheck failed, so the push was blocked. This project has no `test` script, so push-guard ran its checks instead: npm run typecheck failed.')
   expect(ran.deny).toContain(
     'npm run typecheck: 1 error is new with this push (not reported on base000, the commit it builds on; Baseline ran the check on both commits):\n' +
       '- "src/a.ts: TS2322 Type \'\\"BADnew\\"\' is not assignable to type \'number\'."\n' +
@@ -507,7 +507,7 @@ test('no test script: a NEW type error and a lint Baseline could not judge both 
   const ran = await $.tool.call({ tool: 'Bash', command: 'git push' })
 
   expect(w.ran('npm').map(r => r.argv)).toEqual([['npm', 'run', 'lint']])
-  expect(ran.deny).toContain('push-guard: npm run typecheck, npm run lint failed, so the push was blocked.')
+  expect(ran.deny).toContain('push-guard: npm run typecheck, npm run lint failed, so the push was blocked. This project has no `test` script, so push-guard ran its checks instead: npm run typecheck failed, npm run lint failed.')
   expect(ran.deny).toContain('npm run typecheck: 1 error is new with this push')
   expect(ran.deny).toContain('npm run lint failed (exit 1):\n/work/site/src/a.ts\n  3:1  error  Unexpected console statement  no-console\n✖ 1 problem (1 error, 0 warnings)\n(push-guard did not use Baseline: ')
   expect(await band($)).toBe('push-guard: typecheck, lint failing')
@@ -555,4 +555,14 @@ test('checks: off with Baseline installed runs nothing, as before', { options: {
   expect(w.pushed()).toBe(1)
   expect(w.runs).toEqual([])
   expect(w.toasts).toEqual([])
+})
+
+test('no test script: a check with only old errors is named as such when another one blocks', async ($, on) => {
+  world(on, { pkg: CHECK_SCRIPTS, check: perScript({ typecheck: checkReport(0, [TS_OLD]), lint: checkReport(1, [{ ...TS_NEW, id: 'src/a.ts: no-console Unexpected console statement' }]) }) })
+
+  const ran = await $.tool.call({ tool: 'Bash', command: 'git push' })
+
+  expect(ran.deny).toContain('ran its checks instead: npm run typecheck had only errors from before this push, npm run lint failed.')
+  expect(ran.deny).toContain('- "src/a.ts: no-console Unexpected console statement"')
+  expect(await band($)).toBe('push-guard: typecheck, lint: 1 new, 1 still failing (not yours)')
 })

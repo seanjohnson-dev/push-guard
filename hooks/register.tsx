@@ -402,14 +402,14 @@ async function letThroughUnchecked($: any, e: any, next: any, options: any, pkg:
 // failure of a check Baseline could not judge. A script npm does not find is skipped, never a failure
 async function checkProject($: any, e: any, next: any, options: any, pkg: any, dir: string | undefined) {
   const scripts = checkScripts(pkg, options)
-  const ran: string[] = [], failed: string[] = [], sections: string[] = [], reports: Report[] = []
+  const ran: string[] = [], failed: string[] = [], sections: string[] = [], reports: (Report & { script: string })[] = []
   let errors = 0
   let judged = true // every failing check was judged by Baseline, so the line above the prompt can count new ones
   for (const script of scripts) {
     const checked = await checkWithBaseline($, options, dir, script).catch(err => ({ why: `Baseline could not be used (${quote(err?.message ?? err)})` }))
     if (checked && !('why' in checked)) {
       ran.push(script)
-      reports.push(checked)
+      reports.push({ ...checked, script })
       errors += checked.isNew.length + checked.red.length + checked.unknown.length
       if (checked.isNew.length) { failed.push(script); sections.push(newErrors(script, checked)) }
       continue
@@ -435,10 +435,12 @@ async function checkProject($: any, e: any, next: any, options: any, pkg: any, d
   await update($, last, () => ({ failing: errors, checks: ran, failed, ...(judged && reports.length ? { new: isNew, old: red.length } : {}) }))
   if (failed.length) {
     const list = failed.map(s => `npm run ${s}`).join(', ')
+    // Each check that ran and how it came out, so a passing one is not taken for one that never ran
+    const how = (s: string) => (failed.includes(s) ? 'failed' : reports.some(r => r.script === s && r.red.length) ? 'had only errors from before this push' : 'passed')
     return {
       deny:
-        `push-guard: ${list} failed, so the push was blocked. This project has no \`test\` script, so push-guard ran its checks instead ` +
-        `(${ran.map(s => `npm run ${s}`).join(', ')}).\n\n${sections.join('\n\n')}\n\n` +
+        `push-guard: ${list} failed, so the push was blocked. This project has no \`test\` script, so push-guard ran its checks instead: ` +
+        `${ran.map(s => `npm run ${s} ${how(s)}`).join(', ')}.\n\n${sections.join('\n\n')}\n\n` +
         `Fix these, then push again.${isNew ? ' The new errors come from this push: do not call them pre-existing.' : ''}`,
     }
   }

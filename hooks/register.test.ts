@@ -334,7 +334,7 @@ test('no test script: a failing typecheck blocks the push with its last lines; b
   const ran = await $.tool.call({ tool: 'Bash', command: 'git push' })
 
   expect(r.npm).toEqual([['run', 'typecheck'], ['run', 'lint']])
-  expect(ran.deny).toContain('push-guard: npm run typecheck failed, so the push was blocked. This project has no `test` script, so push-guard ran its checks instead (npm run typecheck, npm run lint).')
+  expect(ran.deny).toContain('push-guard: npm run typecheck failed, so the push was blocked. This project has no `test` script, so push-guard ran its checks instead: npm run typecheck failed, npm run lint passed.')
   expect(ran.deny).toContain("npm run typecheck failed (exit 2):\n> site@1.0.0 typecheck\n> tsc --noEmit\nsrc/cart.ts(12,7): error TS2322: Type 'string' is not assignable to type 'number'.\nFound 1 error in src/cart.ts:12")
   expect(ran.deny).not.toContain('did not use Baseline') // there is no Baseline: nothing to say about it
   expect(r.git).toEqual([]) // blocked before the test-changes check
