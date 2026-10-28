@@ -1,14 +1,5 @@
 # Changelog
 
-## Unreleased
-
-- Fixed: a chained `test:all` (`react-scripts test && jest --config jest.api.config.js && npm run check:x`)
-  could be pushed with a break in a later part when Baseline reported only the first part clean. push-guard
-  now reads Baseline's chain report (`runner.name` `chain`, `runner.parts`, `part` on each result) part by
-  part with the same rules as any report: a NEW failure in any trusted part blocks (listed with its part),
-  and the chain is let through only when every part was judged and every part's report holds up;
-  otherwise the script runs as is and blocks on any failure. Tests: 8 new in `hooks/baseline.test.ts`.
-
 ## 0.5.0
 
 - New: with Baseline installed, a push is blocked only by test failures it caused. push-guard runs
@@ -34,16 +25,23 @@
   `checks` is `auto` (default), `all` (also `build`) or `off` (as before: nothing run). The line above the
   prompt names the checks (`push-guard: typecheck, lint passing`). Projects with a `test` script are
   unchanged.
-- Limits: npm `test` scripts that run vitest, jest or another runner Baseline reads per test only;
-  flaky and environment failures go through. See "With Baseline" in the README.
+- Limits: Baseline judges per test only runners it reads (vitest, jest including `react-scripts test`
+  and `craco test`, `node --test`, pytest and others). A chained script is judged part by part; a part
+  with `||`, a pipe, `$(...)` or a redirect is not judged, and then push-guard runs the script and blocks
+  on any failure. Other runners (mocha, tap, ava, `make test`) get a whole-command answer, used only when
+  the command passed. Flaky and environment failures go through. See "With Baseline" in the README.
 - Fixed: a push could hang for 20 minutes. `npm test` in Create React App (and jest/vitest watch scripts)
   waits for input unless `CI=true`, and push-guard waited 10 minutes for Baseline and then 10 more for
   `npm test`. Every command push-guard runs (tests, checks, Baseline) now gets `CI=true` and an empty,
-  closed stdin. New option `timeoutMinutes` (default 5, 1 to 15): one budget per script for Baseline and
-  the plain run together. Baseline gets `--timeout` just under it. A script that doesn't finish blocks
+  closed stdin. New option `timeoutMinutes` (default 5, 1 to 15; above 15 counts as 15, between 0 and 1
+  as 1, 0 or less as 5): one budget per script for Baseline and the plain run together. Baseline gets
+  `--timeout` just under it. A script that doesn't finish blocks
   the push with `push-guard: <command> did not finish within N minutes (watch mode? a hung test?), so the
   push was blocked. Run it yourself to see why, or raise the timeoutMinutes option.`; if Baseline used up
-  the time, the script is not run a second time.
+  the time, the script is not run a second time. On a project whose `npm test` starts watch mode, with
+  `CI` unset, push-guard before the fix hung (Baseline's 10-minute limit ran out, then a second 10-minute
+  `npm test`; the session was cut off after about 13 minutes); after the fix it blocked in 86s with
+  "26 failures are new with this push" (Baseline took 70.1s of that).
 - Fixed: a push that broke only code `npm test` doesn't cover went through silently. With the new option
   `suites` at `auto` (default), push-guard runs `test:all` when `package.json` has one, instead of `test`;
   otherwise `test` plus the `test:*` scripts that look like suites (not watch, e2e, UI, coverage, snapshot,
@@ -59,10 +57,19 @@
   than they give verdicts for make push-guard run the script itself (blocking on any failure). A
   whole-command report that says the command passed is taken as a pass, so it isn't run twice. The rules
   are in "How it decides" in the README.
+- Fixed: a chained `test:all` (`react-scripts test && jest --config jest.api.config.js && npm run check:x`)
+  could be pushed with a break in a later part when Baseline reported only the first part clean. push-guard
+  now reads Baseline's chain report (`runner.name` `chain`, `runner.parts`, `part` on each result) part by
+  part with the same rules as any report: a NEW failure in any trusted part blocks (listed with its part),
+  and the chain is let through only when every part was judged and every part's report holds up;
+  otherwise the script runs as is and blocks on any failure. On a push that broke only the api code of a
+  Create React App project (local bare remote, real headless Claude session), push-guard before the fix
+  pushed silently; after the fix it blocked with "part 2 ... passed 5/5 runs on <sha>, fails 5/5 runs on
+  HEAD", the remote unchanged, and Baseline answered in 23.9s.
 - Messages name every script that ran and how it came out (`push-guard ran: npm test passed, npm run
   test:api failed.`); the nothing-checked toast names the `test:*` scripts it found and did not run.
-- Tests now run with `claude plugin test` (157 pass); three "no test script" tests had a fixture that
-  still gave them a `test` script.
+- Tests now run with `claude plugin test` (165 pass, up from 157, with 8 new for chained scripts in
+  `hooks/baseline.test.ts`); three "no test script" tests had a fixture that still gave them a `test` script.
 
 ## 0.4.0
 

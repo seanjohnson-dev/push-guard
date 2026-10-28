@@ -33,9 +33,10 @@ default), push-guard runs, in the folder being pushed:
 1. `npm run test:all`, if `package.json` has it: the project's own "everything" script, **instead of**
    `npm test`;
 2. otherwise `npm test` and each `test:*` script that looks like a suite (`test:api`, `test:unit`,
-   `test:integration`, ...), as `npm run <script>`. Left out: names with `watch`, `e2e`, `ui`, `playwright`,
-   `cypress`, `storybook`, `coverage`, `update`, `snapshot`, `dev`, `ios`, `android`, `native`, `visual`,
-   `bench` or `lint-staged` in them, scripts with `--watch`, and suites the `test` script already runs
+   `test:integration`, ...), as `npm run <script>`. Left out: names in which a word starts with `watch`,
+   `e2e`, `ui`, `playwright`, `cypress`, `storybook`, `coverage`, `update`, `snapshot`, `dev`, `ios`,
+   `android`, `native`, `visual`, `bench` or `lint-staged` (`test:watch`, `test:e2e-ci`, `test:devices`),
+   scripts with `--watch` or `--watchAll`, and suites the `test` script already runs
    (`npm run test:unit` or `test:*` in it). With no `test` script, the suites alone run as the tests;
 3. with `workspaces` in `package.json`, also `npm test --workspaces --if-present`, unless the scripts above
    already run the workspaces (`--workspaces`, `-ws`, turbo, lerna, nx, `pnpm -r`).
@@ -75,7 +76,7 @@ snapshots, for one, which is what a pre-push check wants.
 | `baseline` | `auto`, `off` | `auto` | run the tests through Baseline when it is installed, so only failures this push caused block it |
 | `checks` | `auto`, `all`, `off` | `auto` | with no `test` script, run the typecheck, lint and format scripts instead (`all`: also `build`; `off`: nothing) |
 | `suites` | `auto`, `root` | `auto` | `auto`: `test:all`, or `test` plus its `test:*` suites, plus workspaces; `root`: only `npm test` (the scripts it leaves out are named, loudly) |
-| `timeoutMinutes` | 1 to 15 | 5 | how long each script may take, Baseline and the plain run together; a number outside is brought into the range (a value that is not a number stops Claude Code loading the plugin, so push-guard would be off) |
+| `timeoutMinutes` | 1 to 15 | 5 | how long each script may take, Baseline and the plain run together; above 15 counts as 15, between 0 and 1 as 1, and 0 or less as the default 5 (a value that is not a number stops Claude Code loading the plugin, so push-guard would be off) |
 
 Set them in Claude Code's plugin settings (`/plugin`), or in `settings.json` under
 `"pluginConfigs": { "push-guard": { "options": { "timeoutMinutes": 10 } } }`. A mistyped `testChanges`,
@@ -167,7 +168,8 @@ it is often slow and may write files or deploy. Set the option `checks` to `all`
 
 The option `checks`: `auto` (the default; a mistyped value counts as `auto`), `all` (also `build`),
 or `off` (as before: a project with no `test` script is pushed with nothing run and nothing said).
-A project that has a `test` script (or `test:all`, or a `test:*` suite) runs its tests instead, as above.
+A project that has a `test` script (or, with `suites` at `auto`, a `test:all` or a `test:*` suite) runs
+its tests instead, as above.
 
 ## With Baseline
 
@@ -211,8 +213,9 @@ push-guard runs the script itself as it always did, and any failing test blocks 
   branch to compare with (a first push);
 - Baseline exits 2 (it couldn't run the tests) or 3 (no trusted result on the base commit), says
   UNKNOWN for a test, prints something other than its JSON report, or does not start;
-- Baseline can't tell the tests apart (see Limits) and would only judge the whole command, or the report
-  fails any of the rules under [How it decides](#how-it-decides).
+- Baseline can't tell the tests apart (see Limits) and would only judge the whole command, could not
+  judge a part of a chained script and found nothing NEW in the others, or the report fails any of the
+  rules under [How it decides](#how-it-decides).
 
 The block then ends with a line saying why Baseline wasn't used. The plain run gets what is left of the
 time budget (at least a minute). If Baseline itself does not finish in time, or stops the test command
@@ -246,22 +249,29 @@ otherwise it runs the script itself and blocks on any failure:
 NEW verdicts block the push whatever the unit. push-guard never decides on its own that a failure is old.
 
 **Chained scripts** (`test:all` = `react-scripts test && jest --config jest.api.config.js && npm run
-check:x`): Baseline (from the release that judges chains) splits the script and judges every part on its
-own; its report says `runner.name` `chain`, lists `runner.parts` (each with `judged`, its own `runner`,
-`exit_code` and `summary`) and puts the part's `index` on each result as `part`. push-guard reads each part
-with the rules above as if it were its own report. A NEW failure in any part whose report holds up blocks
-the push, named with its part (`- part 2 ("jest --config jest.api.config.js"): "api/…": passed 10/10 runs on
-…`), whatever the other parts say. Otherwise the chain is taken only when **every** part was judged and
-every part's report holds up; a part Baseline could not judge (`||`, a pipe, `$(...)`, …: exit 3), a part
-judged only as a whole command that failed, or a result outside the listed parts, and push-guard runs the
-script itself and blocks on any failure. An older Baseline that cut a chained script to its first part
-reported a per-test runner for it; use a Baseline that reports chains (see its changelog).
+check:x`): Baseline splits the script at `&&`, `;` and newlines and judges every part on its own. Its
+report says `runner.name` `chain`, lists `runner.parts` (each with `judged`, its own `runner`, `exit_code`
+and `summary`) and puts the part's `index` on each result as `part`. push-guard reads each part with the
+rules above as if it were its own report:
+
+- A NEW failure in any part whose report holds up blocks the push, whatever the other parts say. It is
+  named with its part: `- part 2 ("jest --config jest.api.config.js"): "api/…": passed 5/5 runs on <sha>,
+  fails 5/5 runs on HEAD: …`.
+- Otherwise the chain is let through only when **every** part was judged and every part's report holds up.
+- A part Baseline did not judge (one with `||`, a pipe, `$(...)` or a redirect), a part judged only as a
+  whole command that failed, a chain report with no parts or with a result outside its parts: push-guard
+  runs the script itself and blocks on any failure, with a line saying why Baseline wasn't used (for a
+  part it could not judge: `Baseline could not judge part 3 ("jest x | tee log"): …`).
+
+push-guard needs a Baseline that reports chains: one that judged only the first part of a chained script
+would look like an ordinary per-test report.
 
 ### How Baseline is found
 
-Once per session (the answer is kept in the session's state, so a Baseline installed mid-session is
-seen in the next session), push-guard takes the first of these that exists and answers
-`baseline version` with `baseline <version>` within 5 seconds:
+Once per session, at the first push it checks, push-guard takes the first of these that exists and
+answers `baseline version` with `baseline <version>` within 5 seconds. The answer, found or not found,
+is kept for the rest of the session, so a Baseline installed after that is seen in the next session.
+Where it looks:
 
 1. `$BASELINE_BIN`, when set: that file and nothing else;
 2. `baseline` in each folder of `$PATH`, as Claude Code's own process sees it;
@@ -273,11 +283,13 @@ The option `baseline`: `auto` (the default) uses Baseline when it is found; `off
 
 ### Limits
 
-- For tests, Baseline reads results per test when the script is a plain call to a runner it
-  knows (`vitest run`, `jest`, `node --test`, `pytest`, ...). A script with `&&`, a pipe or `VAR=value` in
-  front, Create React App's `react-scripts test`, or a runner it doesn't know (mocha, tap, ava) gets a
-  whole-command answer, which push-guard only uses when the command passed: those projects block on
-  any failure, as before. A `test:all` that chains suites is such a script.
+- For tests, Baseline reads results per test for runners it knows: vitest, jest (also Create React
+  App's `react-scripts test` and `craco test`), `node --test`, pytest and others listed in its README. A
+  `VAR=value` in front is carried to the command. A chained script (`&&`, `;`, newlines) is split and each
+  part judged on its own (see Chained scripts above). A part with `||`, a pipe, `$(...)` or a redirect is
+  not judged (UNKNOWN), so push-guard runs the script itself and blocks on any failure.
+- A runner Baseline doesn't know (mocha, tap, ava, `make test`) gets a whole-command answer, which
+  push-guard only uses when the command passed: those projects block on any failure, as before.
 - For checks (a project with no `test` script), an error counts as old when the same file, code and
   message is reported on the base commit. The line number is not compared, so moving code doesn't make
   an error new, but a second identical error in the same file does. A check that fails on both commits
@@ -293,9 +305,10 @@ The option `baseline`: `auto` (the default) uses Baseline when it is found; `off
   the script runs once more, within what is left of `timeoutMinutes`.
 - Baseline runs the tests on the working tree, so uncommitted changes count, as they did before. The
   base commit runs in a temporary git worktree, and Baseline keeps a cache under `.git/baseline/`.
-- Baseline's own limits apply: see its `docs/VERDICTS.md` (a flaky test that passes in the full run is
-  not reported; jest is parser-tested only; Windows is best effort, and there push-guard finds Baseline
-  only through `BASELINE_BIN`).
+- Baseline's own limits apply: see its README and `docs/VERDICTS.md` (a flaky test that passes in the
+  full run is not reported; Windows is best effort, and there push-guard finds Baseline only through
+  `BASELINE_BIN`). Baseline tests jest end to end through a stand-in that writes jest's report and on one
+  real Create React App suite.
 
 ## Install
 
@@ -316,9 +329,28 @@ claude plugin install push-guard --marketplace seanjohnson-dev/push-guard
 In the desktop app: click + next to the prompt box, then Plugins, Add marketplace with
 `seanjohnson-dev/push-guard`, then Add plugin.
 
+### Install order with Baseline
+
+push-guard works without Baseline. To have it block only on failures a push caused:
+
+1. Install Baseline first (Baseline: https://github.com/seanjohnson-dev/baseline), either as the Claude
+   Code plugin `baseline@baseline` from the marketplace `seanjohnson-dev/baseline`:
+
+   ```
+   claude plugin marketplace add seanjohnson-dev/baseline
+   claude plugin install baseline@baseline
+   ```
+
+   or as a `baseline` command on your `PATH`, or anywhere with `BASELINE_BIN` set to its path.
+2. Then install push-guard, as above.
+3. Start a new session. push-guard looks for Baseline once per session, at the first push it checks, and
+   keeps the answer, so a Baseline installed after that is used from the next session on.
+
 ## It runs with your access
 
-push-guard runs `npm test` (or, with no `test` script, `npm run` of the check scripts above), and, to see which files a push changes, read-only `git` commands, on your computer, as you, in the project Claude is working in.
+push-guard runs the project's test scripts (`npm test` or `test:all`, the `test:*` suites, the workspaces'
+tests; with no `test` script, `npm run` of the check scripts above), and, to see which files a push
+changes, read-only `git` commands, on your computer, as you, in the project Claude is working in.
 That runs whatever those scripts say, with the same access to your files,
 network and credentials that you have. With Baseline, the test script of the commit the push builds
 on runs too, several times, in a temporary git worktree. Only install it, and only push from projects,
