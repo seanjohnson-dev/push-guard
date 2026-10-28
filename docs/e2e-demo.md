@@ -144,3 +144,96 @@ Failed tests:
 
 (push-guard did not use Baseline: Baseline can't tell this project's tests apart (runner: "generic").)
 ```
+
+## Projects without a test script
+
+Same setup (Claude Code 2.1.300, push-guard from this folder, `review-layers` disabled, a local bare remote
+per project). The prompt said "do not run any checks yourself" instead of "the tests". The scripts lived
+in `/tmp/pg-checks/kit/` (`setup.sh`, `e2e.sh`, `show.py`, outside the repo and throwaway).
+
+Each project is a small npm project with **no `test` script**:
+
+```json
+"scripts": { "typecheck": "tsc --noEmit", "lint": "eslint -f stylish src" }
+```
+
+`tsc` and `eslint` are tiny node stand-ins in `node_modules/.bin/`. The `tsc` stand-in prints
+`src/a.ts(2,27): error TS2322: Type '"BADnew"' is not assignable to type 'number'.` for each line of
+`src/*.ts` holding `BAD<word>` and exits 1. The `eslint` stand-in prints stylish output for `LINT<word>`.
+They are installed under those names so that Baseline recognises the scripts as `tsc` and eslint and
+reads them error by error. A plain `node check.js` script would be a whole command to Baseline, so
+push-guard would fall back to running it.
+
+| | Base commit (on the remote) | Pushed commit | Result |
+|---|---|---|---|
+| (i) with Baseline | `src/a.ts` clean | adds `'BADnew'` | **blocked**: 1 new type error, with the error |
+| (i) without Baseline | same | same | **blocked**: `npm run typecheck failed (exit 1)` and its output |
+| (ii) with Baseline | `'BADold'` already there | keeps it, adds a clean line | **pushed**, toast + note: 1 pre-existing |
+| (iii) with Baseline | clean | clean change | **pushed**, nothing said |
+| (iv) with Baseline | `"scripts": {}` | adds `'BADnew'` | **pushed loudly**: "nothing was checked" |
+
+Pushed or blocked was checked on the bare remote's `main` after each session. Hook time from the debug
+log: (i) 0.5 to 0.7 s (two Baseline runs, or two `npm run`s), (ii) 1.0 s, (iii) 0.6 s, (iv) 0.1 s.
+
+### (i) With Baseline: blocked, only the new error
+
+The first run used a deny that listed the checks that ran but not how each came out. Claude then
+guessed that lint "probably never ran", although it had passed. The deny now names each check's result.
+The rerun (remote stayed at `13f8fc3`) gave:
+
+```
+push-guard: npm run typecheck failed, so the push was blocked. This project has no `test` script, so push-guard ran its checks instead: npm run typecheck failed, npm run lint passed.
+
+npm run typecheck: 1 error is new with this push (not reported on 13f8fc3, the commit it builds on; Baseline ran the check on both commits):
+- "src/a.ts: TS2322 Type '\"BADnew\"' is not assignable to type 'number'."
+
+Fix these, then push again. The new errors come from this push: do not call them pre-existing.
+```
+
+> I ran `git push` once and push-guard blocked it, so nothing was pushed. [...] `npm run lint` passed
+> and `npm run typecheck` failed with one error [...] It also ran the same check on `13f8fc3` (the base
+> commit) and that commit didn't have this error. So the error is new in this push.
+
+### (i) Without Baseline: blocked, with the output
+
+```
+push-guard: npm run typecheck failed, so the push was blocked. This project has no `test` script, so push-guard ran its checks instead (npm run typecheck, npm run lint).
+
+npm run typecheck failed (exit 1):
+> newerr-nb@1.0.0 typecheck
+> tsc --noEmit
+src/a.ts(2,27): error TS2322: Type '"BADnew"' is not assignable to type 'number'.
+Found 1 error.
+
+Fix these, then push again.
+```
+
+(That is the wording before the fix above. It now reads `... instead: npm run typecheck failed, npm run lint passed.`)
+
+### (ii) With Baseline: the type error was already there, so the push went ahead
+
+Remote `5687c2f` -> `871b413`. The toast:
+
+```
+push-guard: pushed with 1 check error still reported, none from this push: 1 pre-existing (already reported on 5687c2f)
+"src/a.ts: TS2322 Type '\"BADold\"' is not assignable to type 'number'.": pre-existing
+```
+
+> The push worked [...] push-guard let it through. It compared this push with the commit it builds on
+> (`5687c2f`) and found one check error, which it says was already there before your change [...]
+> So the push is in, but `src/a.ts` still has that type error to fix.
+
+### (iii) With Baseline: clean
+
+Remote `cd6998b` -> `8df517f`. Two `baseline check` runs (typecheck, lint), both exit 0, accepted as clean
+checks without running the scripts again. No toast, as for green tests.
+
+### (iv) No scripts at all: pushed, but not quietly
+
+Remote `c3e0430` -> `289b12c` (the pushed commit holds a type error nobody checked). The toast was
+`push-guard: nothing was checked: this project has no test, typecheck or lint script`, and Claude passed
+on the note:
+
+> Push-guard let the push go ahead without checking anything. It said `package.json` has no `test`
+> script and none of the scripts it falls back to: `typecheck`, `type-check`, `tsc`, `lint`, `check` or
+> `format:check`. So no tests, type check or lint ran on this commit.

@@ -5,14 +5,16 @@ A Claude Code plugin that runs `npm test` before Claude runs any `git push`.
 - If a test fails, the push is blocked and Claude is told which tests failed.
   With Baseline installed, only a failure this push caused blocks it (see [With Baseline](#with-baseline)).
 - If the tests pass, the push goes ahead.
-- If the project has no npm tests (no `package.json`, no `test` script, or the
-  placeholder script `npm init` writes), the push goes ahead without running anything.
+- If the project has no `test` script (or only the placeholder `npm init` writes), its own checks
+  run instead: `typecheck`, `lint` and the like (see [Projects without a test script](#projects-without-a-test-script)).
+  If it has none of those either, the push goes ahead, but you and Claude are told nothing was checked.
+  With no `package.json` at all, push-guard does nothing.
 - `git -C <dir> push` and `cd <dir> && git push` are checked in `<dir>`, the project being pushed.
   If the folder is written with `~` or a `$VARIABLE`, the session's folder is checked instead.
 - If the tests pass but the push changes existing tests, the push is held until you OK it
   (see below).
 - The last result shows above the prompt: `push-guard: all tests passing` or
-  `push-guard: 2 tests failing`.
+  `push-guard: 2 tests failing` (for checks: `push-guard: typecheck, lint passing`).
 
 It only checks pushes Claude makes. Pushes you type in your own terminal are not checked.
 
@@ -66,6 +68,42 @@ lets it through with a note, `off` does not look.
   Run by Claude, another plugin or a script (`claude -p`), it allows nothing. But Claude can still
   switch the `testChanges` option to `warn` or `off`, edit the plugin, or push from your terminal's
   shell some other way push-guard does not see. It is a guard against a quiet test edit, not a lock.
+
+## Projects without a test script
+
+Many projects have no tests but do have checks: a type check, a linter, a format check. Pushing
+such a project used to run nothing at all. Now, when `package.json` has no usable `test` script,
+push-guard runs whichever of these scripts it has, in this order:
+
+`typecheck`, `type-check`, `tsc`, `lint`, `check`, `format:check`
+
+each as `npm run <script>`, in the folder being pushed (10 minutes at most each). `build` is not run:
+it is often slow and may write files or deploy. Set the option `checks` to `all` to run it too, last.
+
+- **Without Baseline**, any check that exits non-zero blocks the push. Claude is told which checks
+  failed and which passed, with the last 15 lines of each failing check's output.
+- **With Baseline**, each check runs as `baseline check --json --base <B> -- npm run <script>`.
+  Baseline reads `tsc`, eslint, `prettier --check` and `next build` output error by error and runs the
+  check on the commit the push builds on too. Only errors that are **new** with this push block it.
+  Claude gets each new error, and the old ones are only counted. If every error was already there, the
+  push goes ahead, with a toast, a note to Claude and `push-guard: typecheck: 0 new, 2 still failing (not yours)`
+  above the prompt.
+  If Baseline can't read the check error by error, push-guard runs the script itself and blocks on any
+  failure, ending with a `push-guard did not use Baseline: <why>` line. That covers a script that is
+  not a plain call to one of those tools (`node scripts/check.js`, `tsc && eslint .`), an UNKNOWN
+  verdict, and any of the other reasons under [When Baseline is not used](#when-baseline-is-not-used).
+- A script npm can't find (`Missing script`) is skipped and never blocks.
+- **If there is none of these scripts**, the push goes ahead, but loudly. You get the toast
+  `push-guard: nothing was checked: this project has no test, typecheck or lint script` and the line
+  `push-guard: nothing checked (no test, typecheck or lint script)` above the prompt. Claude gets a note on
+  the push's result that nothing was checked, so it tells you.
+- push-guard does not make up a test command. A project with `node:test` files but no `test` script
+  is treated as having no tests.
+- The hold for pushes that change existing tests applies on all of these paths.
+
+The option `checks`: `auto` (the default; a mistyped value counts as `auto`), `all` (also `build`),
+or `off` (as before: a project with no `test` script is pushed with nothing run and nothing said).
+A project that has a `test` script is not affected: only `npm test` runs, as before.
 
 ## With Baseline
 
@@ -131,11 +169,15 @@ The option `baseline`: `auto` (the default) uses Baseline when it is found; `off
 
 ### Limits
 
-- Only projects push-guard checks at all: those with an npm `test` script. Baseline reads results per
-  test when that script is a plain call to a runner it knows (`vitest run`, `jest`, `pytest`, ...). A
-  script with `&&`, a pipe or `VAR=value` in front, or a runner it doesn't know (`node --test`, mocha,
+- For tests, Baseline reads results per test when the `test` script is a plain call to a runner it
+  knows (`vitest run`, `jest`, `pytest`, ...). A script with `&&`, a pipe or `VAR=value` in front, or a runner it doesn't know (`node --test`, mocha,
   tap, ava) gets a whole-command answer, which push-guard doesn't use: those projects block on any
   failure, as before.
+- For checks (a project with no `test` script), an error counts as old when the same file, code and
+  message is reported on the base commit. The line number is not compared, so moving code doesn't make
+  an error new, but a second identical error in the same file does. A check that fails on both commits
+  for an environment reason (the tool isn't installed) lets the push through as ENVIRONMENT, as a test
+  would.
 - **FLAKY lets the push through.** A bug this push brings in that fails only some of the time (a race,
   a timing change) looks flaky and goes ahead.
 - **ENVIRONMENT lets the push through**: a test failing on both commits for a missing service, variable,
@@ -171,11 +213,11 @@ In the desktop app: click + next to the prompt box, then Plugins, Add marketplac
 
 ## It runs with your access
 
-push-guard runs `npm test` (and, to see which files a push changes, read-only `git` commands) on your computer, as you, in the project Claude is working in.
-That runs whatever the project's `test` script says, with the same access to your files,
+push-guard runs `npm test` (or, with no `test` script, `npm run` of the check scripts above), and, to see which files a push changes, read-only `git` commands, on your computer, as you, in the project Claude is working in.
+That runs whatever those scripts say, with the same access to your files,
 network and credentials that you have. With Baseline, the test script of the commit the push builds
 on runs too, several times, in a temporary git worktree. Only install it, and only push from projects,
-whose test scripts you trust. Read `hooks/register.tsx` before installing: it is short.
+whose scripts you trust. Read `hooks/register.tsx` before installing: it is short.
 
 ## Licence
 

@@ -15,6 +15,16 @@
 - New: the `baseline` option, `auto` (default) or `off`. Baseline is found once per session through
   `BASELINE_BIN`, `$PATH`, or an installed Baseline plugin; without it nothing changes.
 - The hold for pushes that change existing tests still applies, also when the only failures are old.
+- New: projects with no npm `test` script are no longer pushed unchecked. Their `typecheck`,
+  `type-check`, `tsc`, `lint`, `check` and `format:check` scripts run instead (`npm run <script>`, in
+  that order). Without Baseline, any failing check blocks the push, with the last lines of its output.
+  With Baseline, each runs as `baseline check --json --base <B> -- npm run <script>` and only errors new
+  with this push block it. A check Baseline can't read error by error runs as is, and any failure blocks.
+  A missing script never blocks. With none of these scripts, the push goes ahead loudly: a toast
+  (`push-guard: nothing was checked: ...`), a note to Claude and a line above the prompt. The new option
+  `checks` is `auto` (default), `all` (also `build`) or `off` (as before: nothing run). The line above the
+  prompt names the checks (`push-guard: typecheck, lint passing`). Projects with a `test` script are
+  unchanged.
 - Limits: npm `test` scripts that run vitest, jest or another runner Baseline reads per test only;
   flaky and environment failures go through. See "With Baseline" in the README.
 
