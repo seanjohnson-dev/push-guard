@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.5.0
+
+- New: with Baseline installed, a push is blocked only by test failures it caused. push-guard runs
+  `baseline check --json --base <B> -- npm test`, `<B>` being where `HEAD` left its upstream (or the
+  remote's default branch). NEW failures, NEW load errors included, block the push, each listed with
+  its evidence. Failures that were already there (pre-existing, pre-existing with a changed error,
+  flaky, environment) let it through, with a short toast, `0 new, 3 still failing (not yours)` above
+  the prompt, and a note to Claude on the push's result.
+- Whenever Baseline can't answer clearly (exit 2 or 3, UNKNOWN, output that isn't its JSON report, a
+  crash or timeout, a runner it can't read per test, a verdict without the runs to show for it, nothing
+  new to push, a first push), push-guard runs `npm test` as before and blocks on any failure, adding a
+  line saying why Baseline wasn't used.
+- New: the `baseline` option, `auto` (default) or `off`. Baseline is found once per session through
+  `BASELINE_BIN`, `$PATH`, or an installed Baseline plugin; without it nothing changes.
+- The hold for pushes that change existing tests still applies, also when the only failures are old.
+- Limits: npm `test` scripts that run vitest, jest or another runner Baseline reads per test only;
+  flaky and environment failures go through. See "With Baseline" in the README.
+
 ## 0.4.0
 
 - New: a push whose commits change existing tests is held, even when the tests pass. When a test
