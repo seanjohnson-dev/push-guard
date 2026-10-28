@@ -1,7 +1,7 @@
 {
   "name": "push-guard",
   "version": "0.5.0",
-  "description": "Runs npm test before any git push, blocks the push if a test fails (with Baseline installed, only if this push broke it) or if the push changes existing tests, and shows the last result above the prompt",
+  "description": "Runs npm test (or, with no test script, the project's typecheck and lint scripts) before any git push, blocks the push if a test fails (with Baseline installed, only if this push broke it) or if the push changes existing tests, and shows the last result above the prompt",
   "author": { "name": "Sean Johnson" },
   "license": "MIT",
   "types": "./types/index.d.ts",
@@ -19,6 +19,13 @@
       "description": "auto: when Baseline is installed, run the tests through it and block only on failures this push caused; tests already failing before it, flaky or failing for environment reasons let it through with a note. off: never use it (block on any failing test).",
       "default": "auto",
       "options": ["auto", "off"]
+    },
+    "checks": {
+      "type": "string",
+      "title": "Projects without a test script",
+      "description": "auto: run the project's typecheck, type-check, tsc, lint, check and format:check scripts instead (through Baseline when it is installed, blocking only on errors this push brought in); with none of them, push anyway but say loudly that nothing was checked. all: also run build. off: run nothing and say nothing.",
+      "default": "auto",
+      "options": ["auto", "all", "off"]
     }
   }
 }

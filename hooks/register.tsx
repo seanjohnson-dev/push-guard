@@ -23,6 +23,9 @@ const FAILED_TEST = /✖|✗|✕|\bnot ok\b/
 
 // The `test` script `npm init` writes, which only prints an error
 const NO_TEST_SPECIFIED = /no test specified/
+// The scripts a project with no `test` script is checked with instead, in this order; `checks: all` adds build
+const CHECKS = ['typecheck', 'type-check', 'tsc', 'lint', 'check', 'format:check']
+const NOTHING = 'push-guard: nothing was checked: this project has no test, typecheck or lint script'
 
 // A test file: *.test.*, *.spec.*, *_test.*, test_*.py, test.js, or anything in a test/, tests/, spec/,
 // specs/, __tests__/ or __snapshots__/ folder. A project adds its own in package.json: "pushGuard": { "testFiles": [globs] }
@@ -51,6 +54,17 @@ function hasTests(pkg: any): boolean {
   const test = pkg?.scripts?.test
   return typeof test === 'string' && test.trim() !== '' && !NO_TEST_SPECIFIED.test(test)
 }
+
+// The check scripts package.json has, for a project with no `test` script. Anything but `all` (a typo too)
+// is `auto`, so a slip in the option does not turn the checks off; `off` is handled before this
+function checkScripts(pkg: any, options: any): string[] {
+  const names = String(options?.checks ?? '').trim().toLowerCase() === 'all' ? [...CHECKS, 'build'] : CHECKS
+  return names.filter(name => typeof pkg?.scripts?.[name] === 'string' && pkg.scripts[name].trim() !== '')
+}
+
+// npm's answer for a script package.json does not have (npm 7+ and older), which is not a failing check
+const missingScript = (script: string) =>
+  new RegExp(`^npm (?:error|ERR!) missing script: "?${script.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}"?$`, 'i')
 
 // A glob from package.json as a pattern: * and ? stay in one folder, ** crosses folders
 const glob = (text: string) =>
@@ -206,15 +220,18 @@ const quote = (text: unknown) => JSON.stringify(String(text ?? '').slice(0, 300)
 
 // What Baseline's JSON says, checked. `why` when it can't be trusted to tell new failures from old:
 // then push-guard does what it did without Baseline. A failure counts as not this push's only when the
-// report says so with the runs to show for it; nothing is inferred
-function readReport(stdout: string, exitCode: number, range: { head: string; base: string }) {
-  if (exitCode === 2) return { why: 'Baseline could not run the tests (exit 2)' }
+// report says so with the runs to show for it; nothing is inferred. `check`: the command is one of the
+// project's checks (npm run typecheck, lint, ...), whose report lists errors, one result each, not tests
+function readReport(stdout: string, exitCode: number, range: { head: string; base: string }, check = false) {
+  if (exitCode === 2) return { why: `Baseline could not run ${check ? 'the check' : 'the tests'} (exit 2)` }
   if (exitCode === 3) return { why: `Baseline could not get a trusted result on ${range.base.slice(0, 7)} (exit 3)` }
   if (exitCode !== 0 && exitCode !== 1) return { why: `Baseline exited ${exitCode}` }
   let report: any
   try { report = JSON.parse(stdout) } catch { return { why: `Baseline's output was not JSON` } }
   if (report?.tool !== 'baseline' || report.schema !== 1 || report.exit_code !== exitCode || !Array.isArray(report.results)) return { why: "Baseline's report is not one push-guard reads" }
-  if (report.runner?.per_test !== true) return { why: `Baseline can't tell this project's tests apart (runner: ${quote(report.runner?.name)})` }
+  if (report.runner?.per_test !== true) {
+    return { why: `Baseline can't ${check ? "read this check's errors one by one" : "tell this project's tests apart"} (runner: ${quote(report.runner?.name)})` }
+  }
   if (report.base?.sha !== range.base || report.head?.sha !== range.head) return { why: 'Baseline compared other commits than the ones being pushed' }
 
   const isNew: any[] = [], red: any[] = [], unknown: any[] = []
@@ -232,15 +249,18 @@ function readReport(stdout: string, exitCode: number, range: { head: string; bas
   }
   if (exitCode === 1 && !isNew.length) return { why: 'Baseline exited 1 but named no new failure' }
   if (exitCode === 0 && (isNew.length || unknown.length)) return { why: 'Baseline exited 0 but named new or unknown failures' }
-  if (!isNew.length && !red.length && !(report.summary?.tests_passed > 0)) return { why: 'Baseline saw no tests run' }
+  // A check Baseline read error by error (tsc, eslint, prettier) has no tests to count: passing, it lists nothing
+  const checked = check && report.runner?.check === true
+  if (!isNew.length && !red.length && !checked && !(report.summary?.tests_passed > 0)) return { why: 'Baseline saw no tests run' }
   return { base: report.base.short ?? range.base.slice(0, 7), isNew, red, unknown }
 }
 
 type Report = Exclude<ReturnType<typeof readReport>, { why: string }>
 
-// Runs the push's tests through Baseline. Undefined when it is off or not installed (push-guard then runs
-// exactly as it does without Baseline); `why` when it was not used or gave no clear answer
-async function checkWithBaseline($: any, options: any, dir: string | undefined): Promise<Report | { why: string } | undefined> {
+// Runs the push's tests (or, with `script`, `npm run <script>`, one of the project's checks) through Baseline.
+// Undefined when it is off or not installed (push-guard then runs exactly as it does without Baseline);
+// `why` when it was not used or gave no clear answer
+async function checkWithBaseline($: any, options: any, dir: string | undefined, script?: string): Promise<Report | { why: string } | undefined> {
   if (String(options?.baseline ?? '').trim().toLowerCase() === 'off') return undefined
   const bin = await findBaseline($)
   if (!bin) return undefined
@@ -250,19 +270,20 @@ async function checkWithBaseline($: any, options: any, dir: string | undefined):
   if (range.base === EMPTY_TREE) return { why: 'there is no upstream or remote default branch to compare with' }
   if (range.base === range.head) return { why: 'nothing new to push (HEAD is already on the remote)' }
 
-  $.ui.status('push-guard: running npm test through Baseline…')
+  const command = script === undefined ? ['npm', 'test'] : ['npm', 'run', script]
+  $.ui.status(`push-guard: running ${command.join(' ')} through Baseline…`)
   const init = dir === undefined ? { timeoutMs: 600_000 } : { cwd: dir, timeoutMs: 600_000 }
-  const ran = await $.process.run([bin, 'check', '--json', '--base', range.base, '--', 'npm', 'test'], init).catch((err: any) => ({ err }))
+  const ran = await $.process.run([bin, 'check', '--json', '--base', range.base, '--', ...command], init).catch((err: any) => ({ err }))
   $.ui.status(undefined)
   if ('err' in ran) return { why: `Baseline did not finish (${quote(ran.err?.message ?? ran.err)})` }
-  return readReport(ran.stdout, ran.exitCode, range)
+  return readReport(ran.stdout, ran.exitCode, range, script !== undefined)
 }
 
-// "2 pre-existing (already failing on abc1234), 1 flaky"
-function countRed(report: Report) {
+// "2 pre-existing (already failing on abc1234), 1 flaky"; a check's errors are "already reported"
+function countRed(report: Report, was = 'failing') {
   const counts = new Map<string, number>()
   for (const r of report.red) counts.set(r.verdict, (counts.get(r.verdict) ?? 0) + 1)
-  return [...counts].map(([verdict, n]) => `${n} ${NOT_MINE[verdict]}${verdict === 'pre_existing' ? ` (already failing on ${report.base})` : ''}`).join(', ')
+  return [...counts].map(([verdict, n]) => `${n} ${NOT_MINE[verdict]}${verdict === 'pre_existing' ? ` (already ${was} on ${report.base})` : ''}`).join(', ')
 }
 
 const plural = (n: number, word: string) => `${n} ${word}${n === 1 ? '' : 's'}`
@@ -284,9 +305,28 @@ function newFailures(report: Report) {
   )
 }
 
+// How a result that lets the push through is told: about the project's tests, about its checks (a project
+// with no `test` script), or when nothing was run
+type Said = { pass: string; notMine: string; still: (n: number) => string; was: string; tell: string }
+const TESTS: Said = {
+  pass: 'the tests pass',
+  notMine: 'no test fails because of this push',
+  still: n => `${plural(n, 'test')} still red`,
+  was: 'failing',
+  tell: 'Tell the user these tests are still failing, and that they were failing before this push or are flaky or environmental.',
+}
+const CHECKED: Said = {
+  pass: 'the checks pass',
+  notMine: 'no check error is new with this push',
+  still: n => `${plural(n, 'check error')} still reported`,
+  was: 'reported',
+  tell: 'Tell the user these check errors are still reported, and that they were there before this push or are environmental.',
+}
+const UNCHECKED: Said = { ...CHECKED, pass: 'nothing was checked' }
+
 // The push's tests pass, or fail only where Baseline showed the failures are not this push's (`red`):
 // the hold for changed tests still applies, then the push goes ahead
-async function letThrough($: any, e: any, next: any, options: any, pkg: any, dir: string | undefined, red?: Report) {
+async function letThrough($: any, e: any, next: any, options: any, pkg: any, dir: string | undefined, red?: Report, said = TESTS) {
   // Green tests prove little if the push changed the tests to match the code
   // Anything but warn or off (a typo too) holds, so a slip in the option does not open the gate
   const mode = ['warn', 'off'].find(m => m === String(options?.testChanges ?? '').trim().toLowerCase()) ?? 'block'
@@ -296,7 +336,7 @@ async function letThrough($: any, e: any, next: any, options: any, pkg: any, dir
     await update($, held, () => tests.head)
     return {
       deny:
-        `push-guard: ${red ? 'no test fails because of this push' : 'the tests pass'}, but this push changes or deletes existing tests, so it waits for a person's OK.\n\n` +
+        `push-guard: ${red ? said.notMine : said.pass}, but this push changes or deletes existing tests, so it waits for a person's OK.\n\n` +
         `Changed test files:\n${tests.changed.join('\n')}\n\n` +
         'If a test was edited to make it pass, put it back and fix the code instead. If the change is meant ' +
         '(the expected behaviour really changed), ask the user to type /push-guard allow, then push again. Do not run it yourself.',
@@ -311,7 +351,7 @@ async function letThrough($: any, e: any, next: any, options: any, pkg: any, dir
   // Some tests are still red, none because of this push: it goes ahead, and the user and Claude are told what is red
   const ran: any = await next(e)
   if (ran.deny) return ran
-  const still = `${plural(red.red.length, 'test')} still red, none from this push: ${countRed(red)}`
+  const still = `${said.still(red.red.length)}, none from this push: ${countRed(red, said.was)}`
   const named = red.red.map(r => `${quote(r.id)}: ${NOT_MINE[r.verdict]}`)
   const more = (shown: string[]) => (named.length > shown.length ? [...shown, `and ${named.length - shown.length} more`] : shown)
   $.ui.toast([`push-guard: ${ran.isError ? 'let the push through' : 'pushed'} with ${still}`, ...more(named.slice(0, 3))].join('\n'))
@@ -319,8 +359,91 @@ async function letThrough($: any, e: any, next: any, options: any, pkg: any, dir
   const context =
     `push-guard: Baseline compared this push with ${red.base}, the commit it builds on: ${still}, so push-guard let the push through.\n` +
     `${more(why.slice(0, 10)).join('\n')}\n` +
-    'Tell the user these tests are still failing, and that they were failing before this push or are flaky or environmental.'
+    said.tell
   return { ...ran, context: [...(ran.context ?? []), context] }
+}
+
+// ── Projects with no `test` script ─────────────────────────────────────────────────────────────────
+// Their own checks run instead (npm run typecheck, lint, ...), each through Baseline when it is installed,
+// so only errors this push brings in block it. Whatever Baseline can't read error by error runs as is,
+// and then any failure blocks. With no check either, the push goes ahead, but the user and Claude are told
+
+// The deny section for a check where Baseline found errors this push brought in
+function newErrors(script: string, report: Report) {
+  const lines = report.isNew.map(r =>
+    r.kind === 'check_error'
+      ? `- ${quote(r.id)}`
+      : `- ${quote(r.id)}: passed on ${report.base}, fails on HEAD: ${quote(String(r.head?.error_raw || r.head?.message).split('\n')[0])}`,
+  )
+  const others = report.red.length ? `\nAlso still reported, not because of this push: ${countRed(report, 'reported')}. Those do not block the push.` : ''
+  const unknown = report.unknown.length ? `\nBaseline could not compare ${plural(report.unknown.length, 'more error')} with ${report.base}: ${report.unknown.map(r => quote(r.id)).join(', ')}.` : ''
+  const n = report.isNew.length
+  return (
+    `npm run ${script}: ${plural(n, 'error')} ${n === 1 ? 'is' : 'are'} new with this push (not reported on ${report.base}, the commit it builds on; ` +
+    `Baseline ran the check on both commits):\n${lines.join('\n')}${others}${unknown}`
+  )
+}
+
+// What a project with no tests and no checks to run is told: a toast, a note to Claude, the line above the prompt
+async function letThroughUnchecked($: any, e: any, next: any, options: any, pkg: any, dir: string | undefined) {
+  await update($, last, () => ({ failing: 0, nothing: true }))
+  $.ui.toast(NOTHING)
+  const ran: any = await letThrough($, e, next, options, pkg, dir, undefined, UNCHECKED)
+  if (ran?.deny) return ran
+  const looked = String(options?.checks ?? '').trim().toLowerCase() === 'all' ? [...CHECKS, 'build'] : CHECKS
+  const context =
+    `push-guard: nothing was checked before this push. package.json has no \`test\` script and none of the check scripts ` +
+    `push-guard runs instead (${looked.join(', ')}), so the push went ahead without any test, type check or lint. ` +
+    'Tell the user nothing was checked, and that adding a test or typecheck script to package.json would let push-guard check pushes.'
+  return { ...ran, context: [...(ran?.context ?? []), context] }
+}
+
+// Runs each check script, through Baseline when it can; blocks on errors this push brought in, or on any
+// failure of a check Baseline could not judge. A script npm does not find is skipped, never a failure
+async function checkProject($: any, e: any, next: any, options: any, pkg: any, dir: string | undefined) {
+  const scripts = checkScripts(pkg, options)
+  const ran: string[] = [], failed: string[] = [], sections: string[] = [], reports: Report[] = []
+  let errors = 0
+  let judged = true // every failing check was judged by Baseline, so the line above the prompt can count new ones
+  for (const script of scripts) {
+    const checked = await checkWithBaseline($, options, dir, script).catch(err => ({ why: `Baseline could not be used (${quote(err?.message ?? err)})` }))
+    if (checked && !('why' in checked)) {
+      ran.push(script)
+      reports.push(checked)
+      errors += checked.isNew.length + checked.red.length + checked.unknown.length
+      if (checked.isNew.length) { failed.push(script); sections.push(newErrors(script, checked)) }
+      continue
+    }
+    $.ui.status(`push-guard: running npm run ${script}…`)
+    const init = dir === undefined ? { timeoutMs: 600_000 } : { cwd: dir, timeoutMs: 600_000 }
+    const { exitCode, stdout, stderr } = await $.process.run(['npm', 'run', script], init)
+    $.ui.status(undefined)
+    const output = `${stdout}\n${stderr}`.split('\n').map(line => line.trimEnd())
+    if (exitCode !== 0 && output.some(line => missingScript(script).test(line))) continue
+    ran.push(script)
+    if (exitCode === 0) continue
+    errors++
+    judged = false
+    failed.push(script)
+    const note = checked ? `\n(push-guard did not use Baseline: ${checked.why}.)` : ''
+    sections.push(`npm run ${script} failed (exit ${exitCode}):\n${output.filter(Boolean).slice(-15).join('\n')}${note}`)
+  }
+  if (!ran.length) return letThroughUnchecked($, e, next, options, pkg, dir)
+
+  const isNew = reports.reduce((n, r) => n + r.isNew.length, 0)
+  const red = reports.flatMap(r => r.red)
+  await update($, last, () => ({ failing: errors, checks: ran, failed, ...(judged && reports.length ? { new: isNew, old: red.length } : {}) }))
+  if (failed.length) {
+    const list = failed.map(s => `npm run ${s}`).join(', ')
+    return {
+      deny:
+        `push-guard: ${list} failed, so the push was blocked. This project has no \`test\` script, so push-guard ran its checks instead ` +
+        `(${ran.map(s => `npm run ${s}`).join(', ')}).\n\n${sections.join('\n\n')}\n\n` +
+        `Fix these, then push again.${isNew ? ' The new errors come from this push: do not call them pre-existing.' : ''}`,
+    }
+  }
+  const old = red.length ? { base: reports[0].base, isNew: [], red, unknown: [] } : undefined
+  return letThrough($, e, next, options, pkg, dir, old, CHECKED)
 }
 
 export const register: Register = (on, options) => {
@@ -344,9 +467,14 @@ export const register: Register = (on, options) => {
     // `git -C dir push` and `cd dir && git push` push the project in dir, so its tests are the ones to run
     const folder = pushFolder(e.command)
     const dir = folder === undefined || isAbsolute(folder) ? folder : join(await $.session.cwd(), folder)
-    // A project with no npm tests has nothing to check, so the push goes ahead
+    // Not an npm project (no package.json, or one npm can't read either): nothing push-guard can run
     const pkg = await readPackage(() => $.fs.read(dir === undefined ? 'package.json' : join(dir, 'package.json')))
-    if (!hasTests(pkg)) return next(e)
+    if (pkg === undefined) return next(e)
+    // No npm tests: the project's own checks run instead, unless `checks` is off (then, as before, nothing runs)
+    if (!hasTests(pkg)) {
+      if (String(options?.checks ?? '').trim().toLowerCase() === 'off') return next(e)
+      return checkProject($, e, next, options, pkg, dir)
+    }
 
     // With Baseline, only failures this push causes block it. When it can't tell, npm test runs as it always did
     const checked = await checkWithBaseline($, options, dir).catch(err => ({ why: `Baseline could not be used (${quote(err?.message ?? err)})` }))
@@ -383,14 +511,20 @@ export const register: Register = (on, options) => {
 
     const { Text } = $.ui.resolve(e)
 
-    if (result.failing === 0) return <Text color="success">push-guard: all tests passing</Text>
+    if (result.nothing) return <Text color="warning">push-guard: nothing checked (no test, typecheck or lint script)</Text>
+    // A project with no `test` script: the checks that ran, by name
+    const checks = result.checks ? `${result.checks.join(', ')}: ` : ''
+
+    if (result.failing === 0) return <Text color="success">push-guard: {result.checks ? `${result.checks.join(', ')} passing` : 'all tests passing'}</Text>
 
     // Through Baseline: how many failures this push caused, and how many were red already
     if (result.new !== undefined) {
       const unclear = result.failing - result.new - (result.old ?? 0)
       const parts = [`${result.new} new`, `${result.old ?? 0} still failing (not yours)`, ...(unclear > 0 ? [`${unclear} unclear`] : [])]
-      return <Text color={result.new ? 'error' : 'warning'}>push-guard: {parts.join(', ')}</Text>
+      return <Text color={result.new ? 'error' : 'warning'}>push-guard: {checks}{parts.join(', ')}</Text>
     }
+
+    if (result.failed?.length) return <Text color="error">push-guard: {result.failed.join(', ')} failing</Text>
 
     const count = result.failing === -1 ? 'tests failing' : `${result.failing} ${result.failing === 1 ? 'test' : 'tests'} failing`
     return <Text color="error">push-guard: {count}</Text>
