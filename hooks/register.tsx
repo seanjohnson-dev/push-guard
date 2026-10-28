@@ -148,6 +148,181 @@ function countFailing(output: string[]): number {
   return output.filter(line => FAILED_TEST.test(line)).length || -1
 }
 
+// ── With Baseline ──────────────────────────────────────────────────────────────────────────────────
+// Baseline (`baseline check`) runs the tests on HEAD and on the commit the push builds on, and says per
+// failing test whether this push broke it (new) or it was red already (pre_existing, flaky, environment).
+// push-guard then blocks only on new failures. Whenever Baseline can't give a clear answer, push-guard
+// runs npm test as it always did and blocks on any failure: Baseline breaking never lets a push through.
+
+// The Baseline binary, found once per session: a path, '' when there is none, null before the first look
+const baseline = atom({ plugin: 'push-guard', key: 'baseline' } as const, null)
+const BASELINE_VERSION = /^baseline \d+\.\d+/
+// Verdicts that let a push through, and how each is said
+const NOT_MINE: Record<string, string> = {
+  pre_existing: 'pre-existing',
+  pre_existing_error_changed: 'pre-existing (error changed)',
+  flaky: 'flaky',
+  environment: 'environment',
+}
+
+// An environment variable, or '' when it is unset or the mod API gives none
+const envVar = async (get: () => Promise<string | undefined>) => {
+  try { return (await get()) ?? '' } catch { return '' }
+}
+
+// Where Baseline may be: $BASELINE_BIN alone when set; else `baseline` in each $PATH folder, then the
+// bin/ of a Baseline plugin installed in Claude Code (from plugins/installed_plugins.json in its config folder)
+async function* baselineCandidates($: any) {
+  const own = await envVar(() => $.env.get('BASELINE_BIN'))
+  if (own) return yield own
+  const path = await envVar(() => $.env.get('PATH'))
+  for (const dir of path.split(path.includes(';') ? ';' : ':')) if (dir) yield join(dir, 'baseline')
+  const home = await envVar(() => $.env.get('HOME'))
+  const config = (await envVar(() => $.env.get('CLAUDE_CONFIG_DIR'))) || (home && join(home, '.claude'))
+  if (!config) return
+  const installed = await readPackage(() => $.fs.read(join(config, 'plugins/installed_plugins.json')))
+  for (const [id, installs] of Object.entries(installed?.plugins ?? {})) {
+    if (!id.startsWith('baseline@') || !Array.isArray(installs)) continue
+    for (const { installPath } of installs) if (typeof installPath === 'string') yield join(installPath, 'bin/baseline')
+  }
+}
+
+// The Baseline to use: the first candidate that exists and answers `baseline version`; '' for none
+async function findBaseline($: any): Promise<string> {
+  const known = await read($, baseline)
+  if (known !== null) return known
+  let found = ''
+  for await (const bin of baselineCandidates($)) {
+    if (!(await $.fs.exists(bin).catch(() => false))) continue
+    const answer = await $.process.run([bin, 'version'], { timeoutMs: 5_000 }).catch(() => undefined)
+    if (answer?.exitCode === 0 && BASELINE_VERSION.test(answer.stdout)) { found = bin; break }
+  }
+  await update($, baseline, () => found)
+  return found
+}
+
+// Text from the tests, for Claude: quoted on one line, so a test name or an error can't start lines of its own
+const quote = (text: unknown) => JSON.stringify(String(text ?? '').slice(0, 300))
+
+// What Baseline's JSON says, checked. `why` when it can't be trusted to tell new failures from old:
+// then push-guard does what it did without Baseline. A failure counts as not this push's only when the
+// report says so with the runs to show for it; nothing is inferred
+function readReport(stdout: string, exitCode: number, range: { head: string; base: string }) {
+  if (exitCode === 2) return { why: 'Baseline could not run the tests (exit 2)' }
+  if (exitCode === 3) return { why: `Baseline could not get a trusted result on ${range.base.slice(0, 7)} (exit 3)` }
+  if (exitCode !== 0 && exitCode !== 1) return { why: `Baseline exited ${exitCode}` }
+  let report: any
+  try { report = JSON.parse(stdout) } catch { return { why: `Baseline's output was not JSON` } }
+  if (report?.tool !== 'baseline' || report.schema !== 1 || report.exit_code !== exitCode || !Array.isArray(report.results)) return { why: "Baseline's report is not one push-guard reads" }
+  if (report.runner?.per_test !== true) return { why: `Baseline can't tell this project's tests apart (runner: ${quote(report.runner?.name)})` }
+  if (report.base?.sha !== range.base || report.head?.sha !== range.head) return { why: 'Baseline compared other commits than the ones being pushed' }
+
+  const isNew: any[] = [], red: any[] = [], unknown: any[] = []
+  for (const r of report.results) {
+    const [head, base] = [r.head ?? {}, r.base ?? {}]
+    // The runs a verdict that lets the push through rests on: failed on both commits, or passed and failed on one
+    const shown = r.verdict === 'flaky'
+      ? (head.passed > 0 && head.failed > 0) || (base.passed > 0 && base.failed > 0 && head.failed > 0)
+      : head.failed > 0 && base.failed > 0 && (r.verdict !== 'environment' || !!r.env_class)
+    if (r.verdict === 'new') isNew.push(r)
+    else if (r.verdict === 'unknown') unknown.push(r)
+    else if (r.verdict === 'flaky' && r.surfaced === true) continue // passed in the full run on HEAD: not red
+    else if (r.verdict in NOT_MINE && shown) red.push(r)
+    else return { why: `Baseline's verdict on ${quote(r.id)} has nothing to show for it` }
+  }
+  if (exitCode === 1 && !isNew.length) return { why: 'Baseline exited 1 but named no new failure' }
+  if (exitCode === 0 && (isNew.length || unknown.length)) return { why: 'Baseline exited 0 but named new or unknown failures' }
+  if (!isNew.length && !red.length && !(report.summary?.tests_passed > 0)) return { why: 'Baseline saw no tests run' }
+  return { base: report.base.short ?? range.base.slice(0, 7), isNew, red, unknown }
+}
+
+type Report = Exclude<ReturnType<typeof readReport>, { why: string }>
+
+// Runs the push's tests through Baseline. Undefined when it is off or not installed (push-guard then runs
+// exactly as it does without Baseline); `why` when it was not used or gave no clear answer
+async function checkWithBaseline($: any, options: any, dir: string | undefined): Promise<Report | { why: string } | undefined> {
+  if (String(options?.baseline ?? '').trim().toLowerCase() === 'off') return undefined
+  const bin = await findBaseline($)
+  if (!bin) return undefined
+  // The base is what the push holds, not Baseline's own default (on main that would be HEAD itself)
+  const range = await pushRange(gitIn($, dir)).catch(() => undefined)
+  if (!range) return { why: 'git could not say which commits the push holds' }
+  if (range.base === EMPTY_TREE) return { why: 'there is no upstream or remote default branch to compare with' }
+  if (range.base === range.head) return { why: 'nothing new to push (HEAD is already on the remote)' }
+
+  $.ui.status('push-guard: running npm test through Baseline…')
+  const init = dir === undefined ? { timeoutMs: 600_000 } : { cwd: dir, timeoutMs: 600_000 }
+  const ran = await $.process.run([bin, 'check', '--json', '--base', range.base, '--', 'npm', 'test'], init).catch((err: any) => ({ err }))
+  $.ui.status(undefined)
+  if ('err' in ran) return { why: `Baseline did not finish (${quote(ran.err?.message ?? ran.err)})` }
+  return readReport(ran.stdout, ran.exitCode, range)
+}
+
+// "2 pre-existing (already failing on abc1234), 1 flaky"
+function countRed(report: Report) {
+  const counts = new Map<string, number>()
+  for (const r of report.red) counts.set(r.verdict, (counts.get(r.verdict) ?? 0) + 1)
+  return [...counts].map(([verdict, n]) => `${n} ${NOT_MINE[verdict]}${verdict === 'pre_existing' ? ` (already failing on ${report.base})` : ''}`).join(', ')
+}
+
+const plural = (n: number, word: string) => `${n} ${word}${n === 1 ? '' : 's'}`
+
+// The deny for a push that breaks tests: each new failure with its evidence, then what else is red
+function newFailures(report: Report) {
+  const lines = report.isNew.map(r => {
+    const base = r.base?.runs ? `passed ${r.base.passed}/${r.base.runs} runs on ${report.base}` : `not on ${report.base} (new in this push)`
+    const what = r.kind === 'load_error' ? `fails to load on HEAD (${plural(r.head.failed, 'run')})` : `fails ${r.head.failed}/${r.head.runs} runs on HEAD`
+    return `- ${quote(r.id)}: ${base}, ${what}: ${quote(String(r.head.message || r.head.error).split('\n')[0])}`
+  })
+  const others = report.red.length ? `\n\nAlso still failing, not because of this push: ${countRed(report)}. Those do not block the push.` : ''
+  const unknown = report.unknown.length ? `\n\nBaseline could not compare ${plural(report.unknown.length, 'more failing test')} with ${report.base}: ${report.unknown.map(r => quote(r.id)).join(', ')}.` : ''
+  return (
+    `push-guard: npm test fails, and ${plural(report.isNew.length, 'failure')} ${report.isNew.length === 1 ? 'is' : 'are'} new with this push ` +
+    `(not failing on ${report.base}, the commit it builds on), so it was blocked. Baseline ran each failing test on both commits.\n\n` +
+    `New failures:\n${lines.join('\n')}${others}${unknown}\n\n` +
+    'Fix these, then push again. They come from this push: do not call them pre-existing or flaky.'
+  )
+}
+
+// The push's tests pass, or fail only where Baseline showed the failures are not this push's (`red`):
+// the hold for changed tests still applies, then the push goes ahead
+async function letThrough($: any, e: any, next: any, options: any, pkg: any, dir: string | undefined, red?: Report) {
+  // Green tests prove little if the push changed the tests to match the code
+  // Anything but warn or off (a typo too) holds, so a slip in the option does not open the gate
+  const mode = ['warn', 'off'].find(m => m === String(options?.testChanges ?? '').trim().toLowerCase()) ?? 'block'
+  const extra = Array.isArray(pkg?.pushGuard?.testFiles) ? pkg.pushGuard.testFiles.filter((g: unknown) => typeof g === 'string').map(glob) : []
+  const tests = mode === 'off' ? undefined : await testChanges($, dir, extra)
+  if (tests?.changed.length && mode === 'block' && (await read($, allowed)) !== tests.head) {
+    await update($, held, () => tests.head)
+    return {
+      deny:
+        `push-guard: ${red ? 'no test fails because of this push' : 'the tests pass'}, but this push changes or deletes existing tests, so it waits for a person's OK.\n\n` +
+        `Changed test files:\n${tests.changed.join('\n')}\n\n` +
+        'If a test was edited to make it pass, put it back and fix the code instead. If the change is meant ' +
+        '(the expected behaviour really changed), ask the user to type /push-guard allow, then push again. Do not run it yourself.',
+    }
+  }
+  // git could not say (no commit yet, a broken repo): there is nothing to hold, so say so instead of passing quietly
+  if (mode !== 'off' && tests === undefined) $.ui.toast('push-guard: could not tell which test files this push changes')
+  const n = tests?.changed.length || tests?.added.length
+  if (n) $.ui.toast(`push-guard: this push ${tests?.changed.length ? 'changes' : 'adds to'} ${n} test file${n === 1 ? '' : 's'}`)
+  if (!red) return next(e)
+
+  // Some tests are still red, none because of this push: it goes ahead, and the user and Claude are told what is red
+  const ran: any = await next(e)
+  if (ran.deny) return ran
+  const still = `${plural(red.red.length, 'test')} still red, none from this push: ${countRed(red)}`
+  const named = red.red.map(r => `${quote(r.id)}: ${NOT_MINE[r.verdict]}`)
+  const more = (shown: string[]) => (named.length > shown.length ? [...shown, `and ${named.length - shown.length} more`] : shown)
+  $.ui.toast([`push-guard: ${ran.isError ? 'let the push through' : 'pushed'} with ${still}`, ...more(named.slice(0, 3))].join('\n'))
+  const why = red.red.map(r => `- ${quote(r.id)}: ${NOT_MINE[r.verdict]}. ${quote(r.reason)}`)
+  const context =
+    `push-guard: Baseline compared this push with ${red.base}, the commit it builds on: ${still}, so push-guard let the push through.\n` +
+    `${more(why.slice(0, 10)).join('\n')}\n` +
+    'Tell the user these tests are still failing, and that they were failing before this push or are flaky or environmental.'
+  return { ...ran, context: [...(ran.context ?? []), context] }
+}
+
 export const register: Register = (on, options) => {
   on('session.start', async ($, e, next) => {
     await $.command.register({ name: 'push-guard', description: 'push-guard: allow the held push that changes test files', argumentHint: 'allow' })
@@ -173,6 +348,16 @@ export const register: Register = (on, options) => {
     const pkg = await readPackage(() => $.fs.read(dir === undefined ? 'package.json' : join(dir, 'package.json')))
     if (!hasTests(pkg)) return next(e)
 
+    // With Baseline, only failures this push causes block it. When it can't tell, npm test runs as it always did
+    const checked = await checkWithBaseline($, options, dir).catch(err => ({ why: `Baseline could not be used (${quote(err?.message ?? err)})` }))
+    if (checked && !('why' in checked)) {
+      const { isNew, red, unknown } = checked
+      await update($, last, () => ({ failing: isNew.length + red.length + unknown.length, new: isNew.length, old: red.length }))
+      if (isNew.length) return { deny: newFailures(checked) }
+      return letThrough($, e, next, options, pkg, dir, red.length ? checked : undefined)
+    }
+    const note = checked ? `\n\n(push-guard did not use Baseline: ${checked.why}.)` : ''
+
     $.ui.status('push-guard: running npm test…')
     const init = dir === undefined ? { timeoutMs: 600_000 } : { cwd: dir, timeoutMs: 600_000 }
     const { exitCode, stdout, stderr } = await $.process.run(['npm', 'test'], init)
@@ -182,33 +367,12 @@ export const register: Register = (on, options) => {
     const result: TestResult = { failing: exitCode === 0 ? 0 : countFailing(output) }
     await update($, last, () => result)
 
-    if (exitCode === 0) {
-      // Green tests prove little if the push changed the tests to match the code
-      // Anything but warn or off (a typo too) holds, so a slip in the option does not open the gate
-      const mode = ['warn', 'off'].find(m => m === String(options?.testChanges ?? '').trim().toLowerCase()) ?? 'block'
-      const extra = Array.isArray(pkg?.pushGuard?.testFiles) ? pkg.pushGuard.testFiles.filter((g: unknown) => typeof g === 'string').map(glob) : []
-      const tests = mode === 'off' ? undefined : await testChanges($, dir, extra)
-      if (tests?.changed.length && mode === 'block' && (await read($, allowed)) !== tests.head) {
-        await update($, held, () => tests.head)
-        return {
-          deny:
-            `push-guard: the tests pass, but this push changes or deletes existing tests, so it waits for a person's OK.\n\n` +
-            `Changed test files:\n${tests.changed.join('\n')}\n\n` +
-            'If a test was edited to make it pass, put it back and fix the code instead. If the change is meant ' +
-            '(the expected behaviour really changed), ask the user to type /push-guard allow, then push again. Do not run it yourself.',
-        }
-      }
-      // git could not say (no commit yet, a broken repo): there is nothing to hold, so say so instead of passing quietly
-      if (mode !== 'off' && tests === undefined) $.ui.toast('push-guard: could not tell which test files this push changes')
-      const n = tests?.changed.length || tests?.added.length
-      if (n) $.ui.toast(`push-guard: this push ${tests?.changed.length ? 'changes' : 'adds to'} ${n} test file${n === 1 ? '' : 's'}`)
-      return next(e)
-    }
+    if (exitCode === 0) return letThrough($, e, next, options, pkg, dir)
 
     const failed = output.filter(line => FAILED_LINE.test(line))
     const shown = (failed.length ? failed : output.filter(Boolean).slice(-15)).join('\n')
 
-    return { deny: `push-guard: npm test failed (exit ${exitCode}), so the push was blocked.\n\nFailed tests:\n${shown}` }
+    return { deny: `push-guard: npm test failed (exit ${exitCode}), so the push was blocked.\n\nFailed tests:\n${shown}${note}` }
   }).catch(($, e, next) =>
     next.called ? next(e) : { deny: `${$.plugin.name}: could not run npm test, so the push was blocked.` },
   )
@@ -220,6 +384,13 @@ export const register: Register = (on, options) => {
     const { Text } = $.ui.resolve(e)
 
     if (result.failing === 0) return <Text color="success">push-guard: all tests passing</Text>
+
+    // Through Baseline: how many failures this push caused, and how many were red already
+    if (result.new !== undefined) {
+      const unclear = result.failing - result.new - (result.old ?? 0)
+      const parts = [`${result.new} new`, `${result.old ?? 0} still failing (not yours)`, ...(unclear > 0 ? [`${unclear} unclear`] : [])]
+      return <Text color={result.new ? 'error' : 'warning'}>push-guard: {parts.join(', ')}</Text>
+    }
 
     const count = result.failing === -1 ? 'tests failing' : `${result.failing} ${result.failing === 1 ? 'test' : 'tests'} failing`
     return <Text color="error">push-guard: {count}</Text>

@@ -1,7 +1,7 @@
 {
   "name": "push-guard",
   "version": "0.4.0",
-  "description": "Runs npm test before any git push, blocks the push if a test fails or if the push changes existing tests, and shows the last result above the prompt",
+  "description": "Runs npm test before any git push, blocks the push if a test fails (with Baseline installed, only if this push broke it) or if the push changes existing tests, and shows the last result above the prompt",
   "author": { "name": "Sean Johnson" },
   "license": "MIT",
   "types": "./types/index.d.ts",
@@ -12,6 +12,13 @@
       "description": "block holds a push whose commits remove lines from, delete or rename a test file until you type /push-guard allow; warn lets it through with a note; off does not look.",
       "default": "block",
       "options": ["block", "warn", "off"]
+    },
+    "baseline": {
+      "type": "string",
+      "title": "Use Baseline",
+      "description": "auto: when Baseline is installed, run the tests through it and block only on failures this push caused; tests already failing before it, flaky or failing for environment reasons let it through with a note. off: never use it (block on any failing test).",
+      "default": "auto",
+      "options": ["auto", "off"]
     }
   }
 }
