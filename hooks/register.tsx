@@ -56,22 +56,34 @@ function hasTests(pkg: any): boolean {
 const glob = (text: string) =>
   new RegExp(`(?:^|/)${text.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*\*\/?/g, '\0').replace(/\*/g, '[^/]*').replace(/\?/g, '[^/]').replace(/\0/g, '.*')}(?:$|/)`)
 
+// git in the project being pushed: its output, or undefined when git failed
+const gitIn = ($: any, cwd: string | undefined) => async (...args: string[]) => {
+  const { exitCode, stdout } = await $.process.run(['git', ...args], cwd === undefined ? {} : { cwd })
+  return exitCode === 0 ? stdout : undefined
+}
+
+// What the push holds: HEAD, and where HEAD left the upstream (or, on a new branch, the remote's default
+// branch), or git's empty tree on a first push. Undefined when there is no commit
+async function pushRange(git: ReturnType<typeof gitIn>) {
+  const head = (await git('rev-parse', 'HEAD'))?.trim()
+  if (!head) return undefined
+  let base = EMPTY_TREE
+  for (const ref of ['@{upstream}', 'origin/HEAD', 'origin/main', 'origin/master']) {
+    const found = (await git('merge-base', ref, 'HEAD'))?.trim()
+    if (found) { base = found; break }
+  }
+  return { head, base }
+}
+
 // The test files the commits being pushed change: from where HEAD left the upstream (or, on a new branch,
 // the remote's default branch) to HEAD. `changed` lost lines or were deleted or renamed, which is how a
 // failing test is made to pass; `added` are new files or only gained lines. Undefined when git can't say
 async function testChanges($: any, cwd: string | undefined, extra: RegExp[]) {
-  const git = async (...args: string[]) => {
-    const { exitCode, stdout } = await $.process.run(['git', ...args], cwd === undefined ? {} : { cwd })
-    return exitCode === 0 ? stdout : undefined
-  }
+  const git = gitIn($, cwd)
   try {
-    const head = (await git('rev-parse', 'HEAD'))?.trim()
-    if (!head) return undefined
-    let base = EMPTY_TREE
-    for (const ref of ['@{upstream}', 'origin/HEAD', 'origin/main', 'origin/master']) {
-      const found = (await git('merge-base', ref, 'HEAD'))?.trim()
-      if (found) { base = found; break }
-    }
+    const range = await pushRange(git)
+    if (!range) return undefined
+    const { head, base } = range
     const diff = await git('diff', '--numstat', '--no-renames', '-z', base, head)
     if (diff === undefined) return undefined
     const changed: string[] = []
