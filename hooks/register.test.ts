@@ -38,23 +38,17 @@ test('other commands, and the words in a string, do not run the tests', async ($
   expect(runs).toBe(0)
 })
 
-for (const [name, packageJson] of [
-  ['no package.json', () => { throw new Error("ENOENT: no such file or directory, open 'package.json'") }],
-  ['no test script', () => ({ value: JSON.stringify({ name: 'site' }) })],
-  ['the test script npm init writes', () => ({ value: JSON.stringify({ scripts: { test: 'echo "Error: no test specified" && exit 1' } }) })],
-] as const) {
-  test(`${name} lets the push through without running npm test`, async ($, on) => {
-    let runs = 0
-    on('fs.read', packageJson)
-    on('process.run', () => { runs++; return { value: FAILING } })
-    on('tool.call', () => ({ result: { text: 'pushed' } }))
+test('no package.json lets the push through without running anything', async ($, on) => {
+  let runs = 0
+  on('fs.read', () => { throw new Error("ENOENT: no such file or directory, open 'package.json'") })
+  on('process.run', () => { runs++; return { value: FAILING } })
+  on('tool.call', () => ({ result: { text: 'pushed' } }))
 
-    const ran = await $.tool.call({ tool: 'Bash', command: 'git push' })
+  const ran = await $.tool.call({ tool: 'Bash', command: 'git push' })
 
-    expect(ran.deny).toBeUndefined()
-    expect(runs).toBe(0)
-  })
-}
+  expect(ran.deny).toBeUndefined()
+  expect(runs).toBe(0)
+})
 
 const SESSION = '/work/shop'
 
@@ -128,10 +122,14 @@ for (const [name, run, want] of [
 // /push-guard allow typed at the prompt
 const TYPED = { kind: 'composer' }
 
-// A repo beneath the push: npm test passes, HEAD is `head`, the upstream (or `bases`) meets HEAD at base000,
-// and the pushed commits change `files` (path: [lines added, lines removed])
-function repo(on: any, files: Record<string, [number, number]>, opts: { head?: string; bases?: string[]; pkg?: object } = {}) {
+// A repo beneath the push: npm test passes (or npm answers `npm(args)`), HEAD is `head`, the upstream (or `bases`)
+// meets HEAD at base000, and the pushed commits change `files` (path: [lines added, lines removed])
+type NpmAnswer = { exitCode: number; stdout: string; stderr: string }
+function repo(on: any, files: Record<string, [number, number]>, opts: { head?: string; bases?: string[]; pkg?: object; npm?: (args: string[]) => NpmAnswer } = {}) {
   const git: string[] = []
+  const npm: string[][] = []
+  const npmCwds: unknown[] = []
+  const others: string[][] = []
   const toasts: string[] = []
   const bases = opts.bases ?? ['@{upstream}']
   on('fs.read', () => ({ value: JSON.stringify({ scripts: { test: 'node --test' }, ...opts.pkg }) }))
@@ -141,14 +139,15 @@ function repo(on: any, files: Record<string, [number, number]>, opts: { head?: s
   on('process.run', (_: unknown, e: any) => {
     const [cmd, ...args] = e.argv as string[]
     const out = (stdout: string, exitCode = 0) => ({ value: { exitCode, stdout, stderr: '' } })
-    if (cmd === 'npm') return out('all passing\n')
+    if (cmd === 'npm') { npm.push(args); npmCwds.push(e.init?.cwd); return opts.npm ? { value: opts.npm(args) } : out('all passing\n') }
+    if (cmd !== 'git') { others.push(e.argv); return out('', 127) }
     git.push(args.join(' '))
     if (args[0] === 'rev-parse') return opts.head === '' ? out('', 128) : out(`${opts.head ?? 'abc1234567'}\n`)
     if (args[0] === 'merge-base') return bases.includes(args[1]) ? out('base000\n') : out('', 128)
     if (args[0] === 'diff') return out(Object.entries(files).map(([path, [a, d]]) => `${a}\t${d}\t${path}\0`).join(''))
     return out('', 1)
   })
-  return { git, toasts }
+  return { git, npm, npmCwds, others, toasts }
 }
 
 test('a push that edits an expected value in a test is held until you allow it', async ($, on) => {
@@ -317,4 +316,159 @@ test('when git cannot say what the push changes, it goes through with a note', a
 
   expect(ran.deny).toBeUndefined()
   expect(r.toasts.join()).toContain('could not tell which test files')
+})
+
+// ── No `test` script: the project's own checks run instead ──────────────────────────────────────────
+
+const NOTHING = 'push-guard: nothing was checked: this project has no test, typecheck or lint script'
+const TSC_FAIL = {
+  exitCode: 2, stderr: '',
+  stdout: "\n> site@1.0.0 typecheck\n> tsc --noEmit\n\nsrc/cart.ts(12,7): error TS2322: Type 'string' is not assignable to type 'number'.\n\nFound 1 error in src/cart.ts:12\n",
+}
+const OK = { exitCode: 0, stdout: 'done\n', stderr: '' }
+const CHECKS = { typecheck: 'tsc --noEmit', lint: 'eslint .', build: 'vite build' }
+
+test('no test script: a failing typecheck blocks the push with its last lines; build is not run', async ($, on) => {
+  const r = repo(on, { 'src/cart.ts': [2, 1] }, { pkg: { scripts: CHECKS }, npm: args => (args[1] === 'typecheck' ? TSC_FAIL : OK) })
+
+  const ran = await $.tool.call({ tool: 'Bash', command: 'git push' })
+
+  expect(r.npm).toEqual([['run', 'typecheck'], ['run', 'lint']])
+  expect(ran.deny).toContain('push-guard: npm run typecheck failed, so the push was blocked. This project has no `test` script, so push-guard ran its checks instead (npm run typecheck, npm run lint).')
+  expect(ran.deny).toContain("npm run typecheck failed (exit 2):\n> site@1.0.0 typecheck\n> tsc --noEmit\nsrc/cart.ts(12,7): error TS2322: Type 'string' is not assignable to type 'number'.\nFound 1 error in src/cart.ts:12")
+  expect(ran.deny).not.toContain('did not use Baseline') // there is no Baseline: nothing to say about it
+  expect(r.git).toEqual([]) // blocked before the test-changes check
+  for (const surface of ['terminal', 'desktop'] as const) {
+    const ui = await $.ui.mount({ ...BAND, surface })
+    expect((await ui.find({ type: 'Text', text: /push-guard/ }))?.text).toBe('push-guard: typecheck failing')
+    await ui.unmount()
+  }
+})
+
+test('no test script: passing checks let the push through, named above the prompt', async ($, on) => {
+  const r = repo(on, { 'src/cart.ts': [2, 1] }, { pkg: { scripts: CHECKS }, npm: () => OK })
+
+  const ran = await $.tool.call({ tool: 'Bash', command: 'git push' })
+
+  expect(ran.deny).toBeUndefined()
+  expect(r.toasts).toEqual([])
+  expect((ran as any).context).toBeUndefined()
+  const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  expect((await ui.find({ type: 'Text', text: /push-guard/ }))?.text).toBe('push-guard: typecheck, lint passing')
+  await ui.unmount()
+})
+
+test('the checks run in a fixed order, whatever the order in package.json', async ($, on) => {
+  const scripts = { 'format:check': 'prettier --check .', lint: 'eslint .', check: 'svelte-check', tsc: 'tsc', 'type-check': 'vue-tsc', typecheck: 'tsc -b', build: 'vite build', dev: 'vite' }
+  const r = repo(on, {}, { pkg: { scripts }, npm: () => OK })
+
+  await $.tool.call({ tool: 'Bash', command: 'git push' })
+
+  expect(r.npm.map(args => args[1])).toEqual(['typecheck', 'type-check', 'tsc', 'lint', 'check', 'format:check'])
+})
+
+test('checks: all runs build too, last', { options: { checks: 'all' } }, async ($, on) => {
+  const r = repo(on, {}, { pkg: { scripts: CHECKS }, npm: () => OK })
+
+  await $.tool.call({ tool: 'Bash', command: 'git push' })
+
+  expect(r.npm.map(args => args[1])).toEqual(['typecheck', 'lint', 'build'])
+})
+
+test('checks: off runs nothing and says nothing, as before', { options: { checks: 'off' } }, async ($, on) => {
+  const r = repo(on, { 'test/cart.test.js': [1, 1] }, { pkg: { scripts: CHECKS }, npm: () => TSC_FAIL })
+
+  const ran = await $.tool.call({ tool: 'Bash', command: 'git push' })
+
+  expect(ran.deny).toBeUndefined()
+  expect(r.npm).toEqual([])
+  expect(r.git).toEqual([])
+  expect(r.toasts).toEqual([])
+})
+
+test('a mistyped checks value still runs the checks', { options: { checks: 'of' } }, async ($, on) => {
+  const r = repo(on, {}, { pkg: { scripts: CHECKS }, npm: () => TSC_FAIL })
+  const ran = await $.tool.call({ tool: 'Bash', command: 'git push' })
+  expect(r.npm.length).toBe(2)
+  expect(ran.deny).toContain('npm run typecheck, npm run lint failed')
+})
+
+for (const [name, pkg] of [
+  ['no test script', { name: 'site' }],
+  ['the test script npm init writes', { scripts: { test: 'echo "Error: no test specified" && exit 1' } }],
+  ['only scripts that are not checks', { scripts: { dev: 'vite', build: 'vite build', start: 'node server.js' } }],
+] as const) {
+  test(`${name} and no check script: the push goes through, but not quietly`, async ($, on) => {
+    const r = repo(on, { 'src/cart.ts': [2, 1] }, { pkg, npm: () => FAILING })
+
+    const ran = await $.tool.call({ tool: 'Bash', command: 'git push' })
+
+    expect(ran.deny).toBeUndefined()
+    expect(r.npm).toEqual([])
+    expect(r.toasts).toEqual([NOTHING])
+    const context = (ran as any).context?.join('\n') ?? ''
+    expect(context).toContain('push-guard: nothing was checked before this push.')
+    expect(context).toContain('(typecheck, type-check, tsc, lint, check, format:check)')
+    expect(context).toContain('Tell the user nothing was checked')
+    const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
+    expect((await ui.find({ type: 'Text', text: /push-guard/ }))?.text).toBe('push-guard: nothing checked (no test, typecheck or lint script)')
+    await ui.unmount()
+  })
+}
+
+test('node:test files but no test script: no command is made up, the push goes through loudly', async ($, on) => {
+  const r = repo(on, { 'test/cart.test.js': [12, 0] }, { pkg: { name: 'site', type: 'module' } })
+
+  const ran = await $.tool.call({ tool: 'Bash', command: 'git push' })
+
+  expect(ran.deny).toBeUndefined()
+  expect(r.npm).toEqual([])
+  expect(r.others).toEqual([]) // no `node --test`
+  expect(r.toasts).toEqual([NOTHING, 'push-guard: this push adds to 1 test file'])
+})
+
+test('a check script npm does not find never blocks', async ($, on) => {
+  const missing = { exitCode: 1, stdout: '', stderr: 'npm error Missing script: "typecheck"\nnpm error\nnpm error To see a list of scripts, run:\nnpm error   npm run\n' }
+  const r = repo(on, {}, { pkg: { scripts: { typecheck: 'tsc' } }, npm: () => missing })
+
+  const ran = await $.tool.call({ tool: 'Bash', command: 'git push' })
+
+  expect(ran.deny).toBeUndefined()
+  expect(r.npm).toEqual([['run', 'typecheck']])
+  expect(r.toasts).toEqual([NOTHING]) // nothing ran after all
+})
+
+test('a failing check that only mentions a missing script still blocks', async ($, on) => {
+  const other = { exitCode: 1, stdout: 'npm error Missing script: "codegen"\n', stderr: '' }
+  repo(on, {}, { pkg: { scripts: { typecheck: 'npm run codegen && tsc' } }, npm: () => other })
+
+  const ran = await $.tool.call({ tool: 'Bash', command: 'git push' })
+
+  expect(ran.deny).toContain('npm run typecheck failed (exit 1)')
+})
+
+test('passing checks: a push that changes a test is still held', async ($, on) => {
+  repo(on, { 'test/cart.test.js': [1, 1] }, { pkg: { scripts: CHECKS }, npm: () => OK })
+
+  const ran = await $.tool.call({ tool: 'Bash', command: 'git push' })
+
+  expect(ran.deny).toContain('push-guard: the checks pass, but this push changes or deletes existing tests')
+  expect(ran.deny).toContain('"test/cart.test.js"')
+})
+
+test('nothing to check: a push that changes a test is still held', async ($, on) => {
+  const r = repo(on, { 'test/cart.test.js': [1, 1] }, { pkg: { name: 'site' } })
+
+  const ran = await $.tool.call({ tool: 'Bash', command: 'git push' })
+
+  expect(ran.deny).toContain('push-guard: nothing was checked, but this push changes or deletes existing tests')
+  expect(r.toasts).toEqual([NOTHING])
+})
+
+test('git -C dir push runs the checks of dir', async ($, on) => {
+  const r = repo(on, {}, { pkg: { scripts: CHECKS }, npm: () => OK })
+
+  await $.tool.call({ tool: 'Bash', command: 'git -C /work/site push' })
+
+  expect(r.npmCwds).toEqual(['/work/site', '/work/site'])
 })
